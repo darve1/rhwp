@@ -23,6 +23,8 @@ mod foreign_paste;
 mod formatting;
 mod formatting_runs;
 mod header_footer_ops;
+// 기본 문단 번호·글머리표 정의(웹·네이티브 편집기 공용).
+mod head_defaults;
 mod html_import;
 mod numbering_char_shape;
 mod object_ops;
