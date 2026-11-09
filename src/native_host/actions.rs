@@ -124,6 +124,11 @@ pub enum NativeAction {
     AddBookmark {
         name: String,
     },
+    /// The document style `id` on every paragraph the selection touches
+    /// (body text or top-level table cells).
+    ApplyStyle {
+        id: u32,
+    },
     /// 표 나누기: the caret's row starts a new table below.
     SplitTable {},
     /// 표 붙이기: the next table, after only empty paragraphs, joins this one.
@@ -146,6 +151,9 @@ pub enum NativeQuery {
     PageDef {},
     /// The link at the selection start, `{"fieldId","start","end","text","uri"}`, or null.
     Hyperlink {},
+    /// `{"styles":[{"id","name","englishName","type"}],"current":id}`: the
+    /// document's styles and the style of the paragraph at the selection start.
+    Styles {},
     /// `{"exists":…,"text":…}` for a header or footer of that section.
     HeaderFooter { is_header: bool, apply_to: u8 },
     /// The first match at or after the selection end (forward), or the last
@@ -358,6 +366,35 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::ApplyStyle { id } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let (start, end) = Self::ordered(selection);
+                    for paragraph in Self::leaf(start)..=Self::leaf(end) {
+                        match start.cell_path.as_slice() {
+                            [] => core.apply_style_native(
+                                start.section as usize,
+                                paragraph as usize,
+                                id as usize,
+                            )?,
+                            [cell] => core.apply_cell_style_native(
+                                start.section as usize,
+                                start.paragraph as usize,
+                                cell.control as usize,
+                                cell.cell as usize,
+                                paragraph as usize,
+                                id as usize,
+                            )?,
+                            _ => {
+                                return Err(NativeHostError::Unsupported(
+                                    "styles apply to body text and top-level table cells".into(),
+                                ))
+                            }
+                        };
+                    }
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::SetPageDef { props } => {
                 let props = props.to_string();
                 let outcome = self.action_transaction(expected_revision, |core, selection| {
@@ -506,6 +543,27 @@ impl NativeEditor {
                 &Self::core_path(&start),
             )?),
             NativeQuery::PageDef {} => parse(&core.get_page_def_native(start.section as usize)?),
+            NativeQuery::Styles {} => {
+                let styles: Vec<Value> = core
+                    .document()
+                    .doc_info
+                    .styles
+                    .iter()
+                    .enumerate()
+                    .map(|(id, style)| {
+                        json!({
+                            "id": id,
+                            "name": style.local_name,
+                            "englishName": style.english_name,
+                            "type": style.style_type,
+                        })
+                    })
+                    .collect();
+                let current = Self::container(core, &start)?
+                    .get(Self::leaf(&start) as usize)
+                    .map(|paragraph| paragraph.style_id);
+                Ok(json!({ "styles": styles, "current": current }))
+            }
             NativeQuery::Hyperlink {} => {
                 let offset = start.scalar_offset as usize;
                 let links = core.hyperlinks_native(&link_target(&start))?;
@@ -1409,5 +1467,38 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(duplicate, NativeHostError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn styles_list_and_apply_with_undo() {
+        let mut editor = editor("제목", selected(0, 0));
+        let listed = editor.query(NativeQuery::Styles {}).unwrap();
+        let styles = listed["styles"].as_array().unwrap();
+        assert!(!styles.is_empty());
+        let before = listed["current"].clone();
+        let outline = styles
+            .iter()
+            .find(|style| {
+                style["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("개요"))
+            })
+            .expect("a blank document has outline styles");
+        let id = outline["id"].as_u64().unwrap();
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(revision, action(json!({"action": "applyStyle", "id": id})))
+            .unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::Styles {}).unwrap()["current"],
+            json!(id)
+        );
+        let revision = current_revision(&editor);
+        editor.undo(revision).unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::Styles {}).unwrap()["current"],
+            before
+        );
+        assert_eq!(text(&editor), "제목");
     }
 }
