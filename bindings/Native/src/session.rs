@@ -71,6 +71,12 @@ impl ManagedSession {
             Self::Edit(editor) => editor.session(),
         }
     }
+    fn set_editor_marks(&mut self, marks: rhwp_core::native_host::NativeEditorMarks) {
+        match self {
+            Self::View(session) => session.set_editor_marks(marks),
+            Self::Edit(editor) => editor.set_editor_marks(marks),
+        }
+    }
     fn editor_mut(&mut self) -> Result<&mut NativeEditor, NativeHostError> {
         match self {
             Self::Edit(editor) => Ok(editor),
@@ -185,6 +191,9 @@ thread_local! {
     deny_unknown_fields
 )]
 enum Request {
+    SetEditorMarks {
+        marks: rhwp_core::native_host::NativeEditorMarks,
+    },
     ExecuteCommand {
         command: rhwp_core::native_host::commands::NativeEditCommand,
         expected_revision: u64,
@@ -905,6 +914,10 @@ pub unsafe extern "C" fn rhwp_session_request(
                     Ok(json!({"ok":true,"outcome":outcome,"result":result}))
                 }
                 Request::Query { query } => Ok(json!({"ok":true,"result":record.editor_mut()?.query(query)?})),
+                Request::SetEditorMarks { marks } => {
+                    record.set_editor_marks(marks);
+                    Ok(json!({"ok":true}))
+                }
                 Request::PasteHtml {html,expected_revision}=>Ok(edit_result(record.editor_mut()?.paste_html(expected_revision,&html)?)),
                 Request::PrepareSave { format } => {
                     let prepared = record.prepare_save(format)?;

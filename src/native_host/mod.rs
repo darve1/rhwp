@@ -134,7 +134,34 @@ pub struct NativeDocumentSession {
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
+/// Editing marks drawn on screen-profile renders (문단 부호, 조판 부호,
+/// 투명 선). They are view state: they change neither the document nor its
+/// revision, and print/PDF profiles never draw them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeEditorMarks {
+    pub paragraph_marks: bool,
+    pub control_codes: bool,
+    pub transparent_borders: bool,
+}
+
 impl NativeDocumentSession {
+    /// Sets the editing marks; cached page trees are rebuilt on the next render.
+    pub fn set_editor_marks(&mut self, marks: NativeEditorMarks) {
+        self.core.show_paragraph_marks = marks.paragraph_marks;
+        self.core.show_control_codes = marks.control_codes;
+        self.core.show_transparent_borders = marks.transparent_borders;
+        self.core.invalidate_page_tree_cache();
+    }
+
+    pub fn editor_marks(&self) -> NativeEditorMarks {
+        NativeEditorMarks {
+            paragraph_marks: self.core.show_paragraph_marks,
+            control_codes: self.core.show_control_codes,
+            transparent_borders: self.core.show_transparent_borders,
+        }
+    }
+
     pub fn from_core(core: DocumentCore) -> Self {
         let fonts = fonts::NativeFontState::from_environment(core.font_environment().cloned());
         #[cfg(feature = "native-skia")]

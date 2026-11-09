@@ -153,6 +153,11 @@ impl NativeEditor {
         })
     }
 
+    /// View state only: no revision change, no history entry.
+    pub fn set_editor_marks(&mut self, marks: super::NativeEditorMarks) {
+        self.session.set_editor_marks(marks);
+    }
+
     pub fn session(&self) -> &NativeDocumentSession {
         &self.session
     }
@@ -1482,5 +1487,47 @@ mod object_paragraph_tests {
         assert_eq!(text(&editor), "가나다라");
         assert!(has_picture(&editor));
         assert_eq!(editor.session().revision(), revision);
+    }
+}
+
+#[cfg(test)]
+mod marks_tests {
+    use super::*;
+    use crate::native_host::NativeEditorMarks;
+
+    #[test]
+    fn editor_marks_change_neither_document_nor_revision() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.insert_text_native(0, 0, 0, "문단").unwrap();
+        let start = NativeTextPosition {
+            section: 0,
+            paragraph: 0,
+            scalar_offset: 0,
+            cell_path: Vec::new(),
+        };
+        let mut editor = NativeEditor::new(
+            NativeDocumentSession::from_core(core),
+            NativeTextSelection {
+                anchor: start.clone(),
+                focus: start,
+            },
+        )
+        .unwrap();
+        let revision = editor.session().revision();
+        let before = format!("{:?}", editor.session().document().document());
+        let marks = NativeEditorMarks {
+            paragraph_marks: true,
+            control_codes: false,
+            transparent_borders: true,
+        };
+        editor.set_editor_marks(marks);
+        assert_eq!(editor.session().editor_marks(), marks);
+        assert_eq!(editor.session().revision(), revision);
+        assert_eq!(
+            format!("{:?}", editor.session().document().document()),
+            before
+        );
+        assert!(!editor.can_undo());
     }
 }
