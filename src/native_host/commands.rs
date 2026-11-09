@@ -2,7 +2,8 @@
 //!
 //! Left/right are logical text order, not visual bidi navigation. Home/End mean
 //! paragraph boundaries; Up/Down consume the existing core visual-line query.
-//! SelectAll selects the current body section, never cells or other sections.
+//! SelectAll selects the current body section, or the text of the cell holding
+//! the caret. NextCell/PreviousCell are Tab/Shift-Tab in a table.
 //! Hosts must commit/cancel composition before issuing these commands.
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::document_core::native_interaction::{
     NativeTextPosition, NativeTextSelection, NativeVerticalDirection,
 };
+use crate::model::control::Control;
+use crate::model::table::Table;
 
+use super::editor::actions::NativeAction;
 use super::editor::{NativeEditOutcome, NativeEditor};
 use super::NativeHostError;
 
@@ -62,6 +66,11 @@ pub enum NativeEditCommand {
     /// delete a noncollapsed selection.
     JoinPreviousParagraph {},
     SelectAll {},
+    /// Tab in a table: the start of the next cell. In the last cell of a
+    /// top-level table this first adds a row below.
+    NextCell {},
+    /// Shift-Tab in a table: the start of the previous cell.
+    PreviousCell {},
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -134,20 +143,17 @@ impl NativeEditor {
                         "joinPreviousParagraph requires a collapsed selection".into(),
                     ));
                 }
-                self.join_at(expected_revision, self.selection().focus.paragraph)?
+                self.join_at(expected_revision, Self::leaf(&self.selection().focus))?
             }
             NativeEditCommand::SelectAll {} => {
-                let mut start = self.selection().focus.clone();
-                start.paragraph = 0;
-                start.scalar_offset = 0;
-                let paragraphs = &self.session().document().document().sections
-                    [start.section as usize]
-                    .paragraphs;
-                let mut end = start.clone();
-                end.paragraph = u32::try_from(paragraphs.len() - 1).map_err(|_| {
+                // Inside a table cell this selects the cell's text.
+                let focus = &self.selection().focus;
+                let start = Self::at_leaf(focus, 0, 0);
+                let paragraphs = Self::container(self.session().document(), focus)?;
+                let last = u32::try_from(paragraphs.len() - 1).map_err(|_| {
                     NativeHostError::LimitExceeded("paragraph address range exhausted".into())
                 })?;
-                end.scalar_offset = scalar_len(&paragraphs[end.paragraph as usize].text)?;
+                let end = Self::at_leaf(focus, last, scalar_len(&paragraphs[last as usize].text)?);
                 self.set_selection(
                     expected_revision,
                     NativeTextSelection {
@@ -156,11 +162,92 @@ impl NativeEditor {
                     },
                 )?
             }
+            NativeEditCommand::NextCell {} => self.move_to_cell(expected_revision, true)?,
+            NativeEditCommand::PreviousCell {} => self.move_to_cell(expected_revision, false)?,
         };
         Ok(NativeCommandOutcome {
             outcome,
             preferred_x,
         })
+    }
+
+    /// The table holding the innermost cell of `position`.
+    fn innermost_table<'a>(
+        &'a self,
+        position: &NativeTextPosition,
+    ) -> Result<&'a Table, NativeHostError> {
+        let not_in_table =
+            || NativeHostError::InvalidArgument("the caret is not in a table".into());
+        let (leaf, outer) = position.cell_path.split_last().ok_or_else(not_in_table)?;
+        let mut holder = position.clone();
+        holder.cell_path = outer.to_vec();
+        let paragraph = Self::container(self.session().document(), &holder)?
+            .get(Self::leaf(&holder) as usize)
+            .ok_or_else(not_in_table)?;
+        match paragraph.controls.get(leaf.control as usize) {
+            Some(Control::Table(table)) => Ok(table),
+            _ => Err(not_in_table()),
+        }
+    }
+
+    fn move_to_cell(
+        &mut self,
+        revision: u64,
+        forward: bool,
+    ) -> Result<NativeEditOutcome, NativeHostError> {
+        let focus = self.selection().focus.clone();
+        let table = self.innermost_table(&focus)?;
+        let cell = focus
+            .cell_path
+            .last()
+            .expect("checked by innermost_table")
+            .cell as usize;
+        let count = table.cells.len();
+        let target = if forward {
+            cell + 1
+        } else {
+            cell.wrapping_sub(1)
+        };
+        let at = |editor: &mut Self, revision: u64, cell: usize| {
+            let mut position = focus.clone();
+            let leaf = position.cell_path.last_mut().expect("in a cell");
+            leaf.cell = cell as u32;
+            leaf.paragraph = 0;
+            position.scalar_offset = 0;
+            editor.set_selection(
+                revision,
+                NativeTextSelection {
+                    anchor: position.clone(),
+                    focus: position,
+                },
+            )
+        };
+        if target < count {
+            return at(self, revision, target);
+        }
+        if !forward || focus.cell_path.len() != 1 {
+            // Before the first cell, or past the last cell of a nested table.
+            return self.set_selection(revision, self.selection().clone());
+        }
+        let last_row = table.row_count.saturating_sub(1);
+        let added = self
+            .apply_action(
+                revision,
+                NativeAction::InsertRow {
+                    below: true,
+                    count: 1,
+                },
+            )?
+            .0;
+        let table = self.innermost_table(&self.selection().focus.clone())?;
+        let first = table
+            .cells
+            .iter()
+            .position(|cell| cell.row == last_row + 1 && cell.col == 0)
+            .ok_or_else(|| {
+                NativeHostError::InvalidArgument("the new row has no first cell".into())
+            })?;
+        at(self, added.revision, first)
     }
 
     fn move_focus(
@@ -178,9 +265,11 @@ impl NativeEditor {
     }
 
     fn command_text(&self, position: &NativeTextPosition) -> &str {
-        &self.session().document().document().sections[position.section as usize].paragraphs
-            [position.paragraph as usize]
-            .text
+        Self::paragraph_text(self.session().document(), position).unwrap_or("")
+    }
+
+    fn container_len(&self, position: &NativeTextPosition) -> usize {
+        Self::container(self.session().document(), position).map_or(0, <[_]>::len)
     }
 
     fn horizontal_target(
@@ -195,20 +284,15 @@ impl NativeEditor {
         let mut target = self.selection().focus.clone();
         let text = self.command_text(&target);
         let length = scalar_len(text)?;
+        let paragraph = Self::leaf(&target);
         if backward && target.scalar_offset == 0 {
-            if target.paragraph > 0 {
-                target.paragraph -= 1;
+            if paragraph > 0 {
+                target = Self::at_leaf(&target, paragraph - 1, 0);
                 target.scalar_offset = scalar_len(self.command_text(&target))?;
             }
         } else if !backward && target.scalar_offset == length {
-            let count = self.session().document().document().sections[target.section as usize]
-                .paragraphs
-                .len();
-            if (target.paragraph as usize) + 1 < count {
-                target.paragraph = target.paragraph.checked_add(1).ok_or_else(|| {
-                    NativeHostError::LimitExceeded("paragraph address range exhausted".into())
-                })?;
-                target.scalar_offset = 0;
+            if (paragraph as usize) + 1 < self.container_len(&target) {
+                target = Self::at_leaf(&target, paragraph + 1, 0);
             }
         } else {
             let (from, to) = grapheme_span(text, target.scalar_offset, backward);
@@ -229,19 +313,13 @@ impl NativeEditor {
         let text = self.command_text(&focus);
         let length = scalar_len(text)?;
         if backward && focus.scalar_offset == 0 {
-            return self.join_at(revision, focus.paragraph);
+            return self.join_at(revision, Self::leaf(&focus));
         }
         if !backward && focus.scalar_offset == length {
-            let count = self.session().document().document().sections[focus.section as usize]
-                .paragraphs
-                .len();
-            if (focus.paragraph as usize) + 1 == count {
+            if (Self::leaf(&focus) as usize) + 1 == self.container_len(&focus) {
                 return self.set_selection(revision, self.selection().clone());
             }
-            let next = focus.paragraph.checked_add(1).ok_or_else(|| {
-                NativeHostError::LimitExceeded("paragraph address range exhausted".into())
-            })?;
-            return self.join_at(revision, next);
+            return self.join_at(revision, Self::leaf(&focus) + 1);
         }
         // A scalar caret supplied inside a grapheme deletes the entire containing
         // grapheme, never an orphan combining mark or half of an emoji sequence.
@@ -256,21 +334,15 @@ impl NativeEditor {
     fn split_selection(&mut self, revision: u64) -> Result<NativeEditOutcome, NativeHostError> {
         let selection = self.selection().clone();
         let (start, end) = Self::ordered(&selection);
-        let mut after = start.clone();
-        after.paragraph = after.paragraph.checked_add(1).ok_or_else(|| {
+        let next = Self::leaf(start).checked_add(1).ok_or_else(|| {
             NativeHostError::LimitExceeded("paragraph address range exhausted".into())
         })?;
-        after.scalar_offset = 0;
+        let after = Self::at_leaf(start, next, 0);
         self.edit_transaction(revision, |core| {
             if start != end {
                 Self::apply_replacement(core, &selection, "")?;
             }
-            core.split_paragraph_native(
-                start.section as usize,
-                start.paragraph as usize,
-                start.scalar_offset as usize,
-                None,
-            )?;
+            Self::split_in_container(core, start)?;
             Ok(NativeTextSelection {
                 anchor: after.clone(),
                 focus: after,
@@ -286,11 +358,8 @@ impl NativeEditor {
         if paragraph == 0 {
             return self.set_selection(revision, self.selection().clone());
         }
-        let mut next = self.selection().focus.clone();
-        next.paragraph = paragraph;
-        next.scalar_offset = 0;
-        let mut previous = next.clone();
-        previous.paragraph -= 1;
+        let next = Self::at_leaf(&self.selection().focus, paragraph, 0);
+        let mut previous = Self::at_leaf(&next, paragraph - 1, 0);
         previous.scalar_offset = scalar_len(self.command_text(&previous))?;
         let span = NativeTextSelection {
             anchor: previous.clone(),
@@ -301,7 +370,7 @@ impl NativeEditor {
         // text and controls this join would move.
         Self::check_body_text_span(self.session().document(), &span)?;
         self.edit_transaction(revision, |core| {
-            core.merge_paragraph_native(next.section as usize, paragraph as usize)?;
+            Self::merge_in_container(core, &next)?;
             Ok(NativeTextSelection {
                 anchor: previous.clone(),
                 focus: previous,
@@ -354,9 +423,8 @@ impl NativeEditor {
         let selection = self.selection();
         Self::validate_selection(self.session().document(), selection)?;
         let focus = &selection.focus;
-        let document = self.session().document().document();
-        let paragraph =
-            &document.sections[focus.section as usize].paragraphs[focus.paragraph as usize];
+        let paragraphs = Self::container(self.session().document(), focus)?;
+        let paragraph = &paragraphs[Self::leaf(focus) as usize];
         let length = paragraph.text.chars().count();
         let start = (focus.scalar_offset as usize).saturating_sub(NATIVE_IME_CONTEXT_SCALARS / 2);
         let end = length.min(start.saturating_add(NATIVE_IME_CONTEXT_SCALARS));
@@ -367,7 +435,7 @@ impl NativeEditor {
             .take(end - start)
             .collect();
         let anchor = &selection.anchor;
-        let anchor_scalar = (anchor.paragraph == focus.paragraph
+        let anchor_scalar = (Self::leaf(anchor) == Self::leaf(focus)
             && (anchor.scalar_offset as usize) >= start
             && (anchor.scalar_offset as usize) <= end)
             .then(|| anchor.scalar_offset - start as u32);
@@ -375,8 +443,9 @@ impl NativeEditor {
         let mut selected = String::new();
         let mut count = 0usize;
         let mut truncated = false;
-        'paragraphs: for index in from.paragraph..=to.paragraph {
-            if index > from.paragraph {
+        let (first, last) = (Self::leaf(from), Self::leaf(to));
+        'paragraphs: for index in first..=last {
+            if index > first {
                 if count == NATIVE_IME_CONTEXT_SCALARS {
                     truncated = true;
                     break;
@@ -384,13 +453,13 @@ impl NativeEditor {
                 selected.push('\n');
                 count += 1;
             }
-            let text = &document.sections[from.section as usize].paragraphs[index as usize].text;
-            let left = if index == from.paragraph {
+            let text = &paragraphs[index as usize].text;
+            let left = if index == first {
                 from.scalar_offset as usize
             } else {
                 0
             };
-            let right = if index == to.paragraph {
+            let right = if index == last {
                 to.scalar_offset as usize
             } else {
                 text.chars().count()

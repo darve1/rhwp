@@ -10,6 +10,7 @@ use rhwp_core::document_core::native_interaction::{
     NativeTextPosition, NativeTextSelection, NativeVerticalDirection,
 };
 use rhwp_core::native_host::accessibility::NativeAccessibilityRequest;
+use rhwp_core::native_host::editor::actions::{NativeAction, NativeQuery};
 use rhwp_core::native_host::editor::ime_edit::{NativeImeEdit, NativeImeEditContext};
 use rhwp_core::native_host::editor::{NativeCompositionFocusLoss, NativeEditOutcome, NativeEditor};
 use rhwp_core::native_host::presentation::{NativePresentationId, NativePresentationStamp};
@@ -219,6 +220,15 @@ enum Request {
     Accessibility {
         request: NativeAccessibilityRequest,
         selection: Option<NativeTextSelection>,
+    },
+    /// Formatting and document-wide actions (see `native_host::editor::actions`).
+    ApplyAction {
+        action: NativeAction,
+        expected_revision: u64,
+    },
+    /// Read-only queries at the current selection.
+    Query {
+        query: NativeQuery,
     },
     PrepareSave {
         format: NativeSaveFormat,
@@ -890,6 +900,11 @@ pub unsafe extern "C" fn rhwp_session_request(
                     Ok(json!({"ok":true,"kind":"clipboard","payload":payload,"outcome":outcome}))
                 },
                 Request::PasteText {text,expected_revision}=>Ok(edit_result(record.editor_mut()?.paste_text(expected_revision,&text)?)),
+                Request::ApplyAction { action, expected_revision } => {
+                    let (outcome, result) = record.editor_mut()?.apply_action(expected_revision, action)?;
+                    Ok(json!({"ok":true,"outcome":outcome,"result":result}))
+                }
+                Request::Query { query } => Ok(json!({"ok":true,"result":record.editor_mut()?.query(query)?})),
                 Request::PasteHtml {html,expected_revision}=>Ok(edit_result(record.editor_mut()?.paste_html(expected_revision,&html)?)),
                 Request::PrepareSave { format } => {
                     let prepared = record.prepare_save(format)?;

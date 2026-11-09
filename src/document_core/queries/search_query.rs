@@ -425,6 +425,47 @@ impl DocumentCore {
         }
     }
 
+    /// Native-host search: every match in body text and (nested) table-cell
+    /// text as a native position and scalar length, in document order. Text
+    /// boxes and equation scripts are left out; the native editor cannot
+    /// address them.
+    pub(crate) fn native_text_search_hits(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<(
+        crate::document_core::native_interaction::NativeTextPosition,
+        usize,
+    )> {
+        use crate::document_core::native_interaction::{NativeCellPathEntry, NativeTextPosition};
+        if query.is_empty() {
+            return Vec::new();
+        }
+        search_all(self, query, case_sensitive)
+            .into_iter()
+            .filter(|hit| !hit.is_text_box && hit.equation_control.is_none())
+            .map(|hit| {
+                let cell_path = hit.cell_context.as_ref().map_or_else(Vec::new, |cell| {
+                    cell.path
+                        .iter()
+                        .map(|&(control, cell, paragraph)| NativeCellPathEntry {
+                            control: control as u32,
+                            cell: cell as u32,
+                            paragraph: paragraph as u32,
+                        })
+                        .collect()
+                });
+                let position = NativeTextPosition {
+                    section: hit.sec as u32,
+                    paragraph: hit.para as u32,
+                    scalar_offset: hit.char_offset as u32,
+                    cell_path,
+                };
+                (position, hit.length)
+            })
+            .collect()
+    }
+
     /// 문서 전체 검색 (모든 매치 반환)
     ///
     /// 본문 문단의 모든 매치를 배열로 반환한다. 표/글상자 내부 포함 여부는

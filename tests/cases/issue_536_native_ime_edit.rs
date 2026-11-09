@@ -1,5 +1,6 @@
 //! 관계형: UTF-16 원문·선택·히스토리와 원자적 rollback·presentation 무효화를 검사한다.
-//! 주석 갱신: 2026-11-07T16:41:01+09:00; 직전 파일 커밋: 2026-11-07T07:41:53+09:00 (0f629e936bd6d3f96a05c36a1fe18c9dcac663dc).
+//! 주석 갱신: 2026-11-10T02:25:00+09:00; 직전 파일 커밋: 2026-11-08T19:09:35+09:00 (c9095c5f67632e6721e800ccc7fb43ea49d26682).
+//! 객체가 든 문단에서도 IME 문맥을 주며, 셀·문단 경계 검사는 그대로다.
 //! 입력은 파일 내부 합성 문서·PageLayerTree 또는 저장소의 허가된 글꼴 fixture다.
 //! API·소유·자원/합성 paint 계약이며 실물 문서 페이지의 조판 위치를 고정하지 않는다.
 //! 이 assertion의 독립 한컴 PDF 대비 Native/fresh WASM raw 측정값은 비해당이다.
@@ -381,7 +382,7 @@ fn native_ime_snapshot_budget_rejection_preserves_live_composition() {
 }
 
 #[test]
-fn native_ime_context_rejects_semantic_paragraphs_cells_and_cross_paragraph_selection() {
+fn native_ime_context_allows_object_paragraphs_rejects_cells_and_cross_paragraph_selection() {
     let mut core = core("AB");
     let mut document = core.document().clone();
     document.sections[0].paragraphs[0]
@@ -389,10 +390,9 @@ fn native_ime_context_rejects_semantic_paragraphs_cells_and_cross_paragraph_sele
         .push(Control::Bookmark(Default::default()));
     core.set_document(document);
     let editor = NativeEditor::new(NativeDocumentSession::from_core(core), selected(0, 0)).unwrap();
-    assert!(matches!(
-        editor.ime_edit_context(0),
-        Err(NativeHostError::Unsupported(_))
-    ));
+    // A paragraph holding an object still has an IME context: replacements
+    // that would remove the object are refused when applied.
+    assert_eq!(editor.ime_edit_context(0).unwrap().context.text, "AB");
     let mut editor = self::editor("AB");
     let mut context = editor.ime_edit_context(0).unwrap();
     context.selection.focus.cell_path.push(NativeCellPathEntry {

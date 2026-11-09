@@ -62,13 +62,26 @@ impl NativeEditor {
         let html = if empty_fragment {
             None
         } else {
-            let exported = self.session().document().export_selection_html_native(
-                start.section as usize,
-                start.paragraph as usize,
-                start.scalar_offset as usize,
-                end.paragraph as usize,
-                end.scalar_offset as usize,
-            )?;
+            let core = self.session().document();
+            let exported = if start.cell_path.is_empty() {
+                core.export_selection_html_native(
+                    start.section as usize,
+                    start.paragraph as usize,
+                    start.scalar_offset as usize,
+                    end.paragraph as usize,
+                    end.scalar_offset as usize,
+                )?
+            } else {
+                core.export_selection_in_cell_html_by_path_native(
+                    start.section as usize,
+                    start.paragraph as usize,
+                    &Self::core_path(start),
+                    Self::leaf(start) as usize,
+                    start.scalar_offset as usize,
+                    Self::leaf(end) as usize,
+                    end.scalar_offset as usize,
+                )?
+            };
             Some(compact_exported_html(&exported)?.into_owned())
         };
         if plain_text
@@ -141,21 +154,13 @@ impl NativeEditor {
                 .checked_add(lines[0].chars().count() as u32)
                 .ok_or_else(clipboard_limit)?;
             for line in &lines[1..] {
-                core.split_paragraph_native(
-                    focus.section as usize,
-                    focus.paragraph as usize,
-                    focus.scalar_offset as usize,
-                    None,
-                )?;
-                focus.paragraph = focus.paragraph.checked_add(1).ok_or_else(clipboard_limit)?;
-                focus.scalar_offset = 0;
+                Self::split_in_container(core, &focus)?;
+                let next = Self::leaf(&focus)
+                    .checked_add(1)
+                    .ok_or_else(clipboard_limit)?;
+                focus = Self::at_leaf(&focus, next, 0);
                 if !line.is_empty() {
-                    core.insert_text_native(
-                        focus.section as usize,
-                        focus.paragraph as usize,
-                        0,
-                        line,
-                    )?;
+                    Self::insert_in_container(core, &focus, line)?;
                 }
                 focus.scalar_offset = line.chars().count() as u32;
             }
@@ -179,6 +184,11 @@ impl NativeEditor {
             return self.set_selection(expected_revision, selection);
         }
         let (start, end) = Self::ordered(&selection);
+        if !start.cell_path.is_empty() {
+            return Err(NativeHostError::Unsupported(
+                "HTML paste into table cells is not supported; paste plain text".into(),
+            ));
+        }
         check_imported_paragraphs(self.session().document(), start, end)?;
         let mut empty_html = false;
         let result = self.edit_transaction(expected_revision, |core| {
@@ -402,22 +412,23 @@ fn clipboard_selection_size(
     selection: &NativeTextSelection,
 ) -> Result<(usize, bool), NativeHostError> {
     let (start, end) = NativeEditor::ordered(selection);
-    let paragraphs = &core.document().sections[start.section as usize].paragraphs;
-    let mut bytes = (end.paragraph - start.paragraph) as usize;
+    let paragraphs = NativeEditor::container(core, start)?;
+    let (first, last) = (NativeEditor::leaf(start), NativeEditor::leaf(end));
+    let mut bytes = (last - first) as usize;
     let mut empty_fragment = false;
     if bytes >= MAX_CLIPBOARD_PARAGRAPHS {
         return Err(NativeHostError::LimitExceeded(
             "clipboard paragraph limit exceeded".into(),
         ));
     }
-    for index in start.paragraph..=end.paragraph {
+    for index in first..=last {
         let text = &paragraphs[index as usize].text;
-        let from = if index == start.paragraph {
+        let from = if index == first {
             start.scalar_offset as usize
         } else {
             0
         };
-        let count = if index == end.paragraph {
+        let count = if index == last {
             (end.scalar_offset as usize) - from
         } else {
             usize::MAX
@@ -447,7 +458,7 @@ fn check_imported_paragraphs(
     start: &NativeTextPosition,
     end: &NativeTextPosition,
 ) -> Result<(), NativeHostError> {
-    NativeEditor::check_body_text_span(
+    NativeEditor::check_plain_paragraphs(
         core,
         &NativeTextSelection {
             anchor: start.clone(),

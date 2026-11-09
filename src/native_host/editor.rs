@@ -1,7 +1,9 @@
 //! Opt-in native editor state. The document engine itself remains history-free.
 //!
-//! This first surface edits body text only. Offsets are Unicode scalar indices;
-//! cell editing, object-bearing paragraph mutations, inline-control affinity and
+//! This surface edits body text and table-cell text. A selection stays inside
+//! one container: the body paragraphs of a section, or the paragraphs of one
+//! (possibly nested) table cell. Offsets are Unicode scalar indices;
+//! object-bearing paragraph mutations, inline-control affinity and
 //! tabs are rejected explicitly. Read-only selection may span floating objects.
 //! Paragraph split/join and grapheme navigation live in `commands`. OS IME events
 //! and screen coordinates belong to the host, not to this session.
@@ -10,12 +12,16 @@ use std::collections::VecDeque;
 
 use crate::document_core::native_interaction::{NativeTextPosition, NativeTextSelection};
 use crate::model::control::Control;
+use crate::model::paragraph::Paragraph;
 use crate::DocumentCore;
 
 use super::{NativeDocumentSession, NativeHostError};
 
 #[path = "ime_edit.rs"]
 pub mod ime_edit;
+
+#[path = "actions.rs"]
+pub mod actions;
 
 const DEFAULT_HISTORY_CAPACITY: usize = 16;
 
@@ -164,17 +170,19 @@ impl NativeEditor {
     }
 
     /// Save without committing an unfinished IME preview. HWP stores current
-    /// body focus; HWPX retains its existing source-settings/default policy.
+    /// body focus; with the focus in a table cell, whose caret the saved-caret
+    /// contract does not cover, it keeps the stored caret instead. HWPX
+    /// retains its existing source-settings/default policy.
     pub fn prepare_save(
         &mut self,
         format: super::save::NativeSaveFormat,
     ) -> Result<super::save::PreparedSave, NativeHostError> {
         self.require_no_composition()?;
         match format {
-            super::save::NativeSaveFormat::Hwp => self
+            super::save::NativeSaveFormat::Hwp if self.selection.focus.cell_path.is_empty() => self
                 .session
                 .prepare_save_with_caret(format, &self.selection.focus),
-            super::save::NativeSaveFormat::Hwpx => self.session.prepare_save(format),
+            _ => self.session.prepare_save(format),
         }
     }
 
@@ -551,30 +559,25 @@ impl NativeEditor {
         core: &DocumentCore,
         selection: &NativeTextSelection,
     ) -> Result<(), NativeHostError> {
-        if !selection.anchor.cell_path.is_empty() || !selection.focus.cell_path.is_empty() {
-            return Err(NativeHostError::Unsupported(
-                "native editor currently supports body text only; cell editing is not supported"
-                    .into(),
-            ));
-        }
         for position in [&selection.anchor, &selection.focus] {
+            // A cell path into a control that is not a table stays "unsupported".
             core.validate_native_text_position(position)
-                .map_err(|error| NativeHostError::InvalidArgument(error.to_string()))?;
+                .map_err(NativeHostError::from)?;
         }
         if selection.anchor.section != selection.focus.section {
             return Err(NativeHostError::Unsupported(
                 "cross-section text replacement is not supported".into(),
             ));
         }
+        if !Self::same_container(&selection.anchor, &selection.focus) {
+            return Err(NativeHostError::Unsupported(
+                "a selection cannot cross a table-cell boundary".into(),
+            ));
+        }
         let (start, end) = Self::ordered(selection);
-        for paragraph in start.paragraph..=end.paragraph {
-            core.check_native_interaction_support(&NativeTextPosition {
-                section: start.section,
-                paragraph,
-                scalar_offset: 0,
-                cell_path: Vec::new(),
-            })
-            .map_err(|error| NativeHostError::Unsupported(error.to_string()))?;
+        for paragraph in Self::leaf(start)..=Self::leaf(end) {
+            core.check_native_interaction_support(&Self::at_leaf(start, paragraph, 0))
+                .map_err(|error| NativeHostError::Unsupported(error.to_string()))?;
         }
         Ok(())
     }
@@ -582,8 +585,10 @@ impl NativeEditor {
     pub(super) fn ordered(
         selection: &NativeTextSelection,
     ) -> (&NativeTextPosition, &NativeTextPosition) {
-        if (selection.anchor.paragraph, selection.anchor.scalar_offset)
-            <= (selection.focus.paragraph, selection.focus.scalar_offset)
+        if (
+            Self::leaf(&selection.anchor),
+            selection.anchor.scalar_offset,
+        ) <= (Self::leaf(&selection.focus), selection.focus.scalar_offset)
         {
             (&selection.anchor, &selection.focus)
         } else {
@@ -591,9 +596,13 @@ impl NativeEditor {
         }
     }
 
-    /// The scalar body-edit surface cannot preserve/export semantic controls
-    /// when removing a paragraph. Inspect the entire validated span, including
-    /// middle paragraphs and floating objects the interaction query can traverse.
+    /// The scalar edit surface removes text, never objects: a range may hold
+    /// paragraphs with controls (fields, bookmarks, floating pictures and
+    /// tables...), but no control may be anchored strictly inside it, where
+    /// removing the text would also remove the control. A control at text
+    /// position `p` sits before character `p`, so one at either end of the
+    /// range stays. Inserting at a caret never removes a control. Inline
+    /// (treat-as-char) objects are already rejected by selection validation.
     /// Keep this separate from selection validation: read-only navigation and
     /// identical-text no-ops do not need to modify an object's paragraph.
     pub(super) fn check_body_text_span(
@@ -601,8 +610,51 @@ impl NativeEditor {
         selection: &NativeTextSelection,
     ) -> Result<(), NativeHostError> {
         let (start, end) = Self::ordered(selection);
-        for paragraph in &core.document().sections[start.section as usize].paragraphs
-            [start.paragraph as usize..=end.paragraph as usize]
+        let (first, last) = (Self::leaf(start), Self::leaf(end));
+        let paragraphs = Self::container(core, start)?;
+        for index in first..=last {
+            let paragraph = &paragraphs[index as usize];
+            let after = if index == first {
+                start.scalar_offset as usize
+            } else {
+                0
+            };
+            let before = end.scalar_offset as usize;
+            // Removed: [after, before) of a single paragraph; the tail of the
+            // first and the head of the last paragraph of a longer range (they
+            // merge); every middle paragraph whole.
+            let removes = |position: usize| match (index == first, index == last) {
+                (true, true) => position > after && position < before,
+                (true, false) => position > after,
+                (false, true) => position < before,
+                (false, false) => true,
+            };
+            let anchored = paragraph
+                .control_text_positions()
+                .into_iter()
+                .zip(&paragraph.controls)
+                .any(|(position, control)| {
+                    !matches!(control, Control::SectionDef(_) | Control::ColumnDef(_))
+                        && removes(position)
+                });
+            if anchored {
+                return Err(NativeHostError::Unsupported(
+                    "the range holds an object; text edits do not remove objects".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Imported paragraphs (HTML paste) must be plain text: no controls other
+    /// than the section/column definitions a blank document carries.
+    pub(super) fn check_plain_paragraphs(
+        core: &DocumentCore,
+        selection: &NativeTextSelection,
+    ) -> Result<(), NativeHostError> {
+        let (start, end) = Self::ordered(selection);
+        for paragraph in
+            &Self::container(core, start)?[Self::leaf(start) as usize..=Self::leaf(end) as usize]
         {
             if paragraph.controls.iter().any(|control| {
                 // Blank documents carry these section/column definitions; core
@@ -639,16 +691,19 @@ impl NativeEditor {
 
     pub(super) fn selected_text(&self, selection: &NativeTextSelection) -> String {
         let (start, end) = Self::ordered(selection);
-        let paragraphs = &self.session.core.document().sections[start.section as usize].paragraphs;
-        (start.paragraph..=end.paragraph)
+        let Ok(paragraphs) = Self::container(&self.session.core, start) else {
+            return String::new();
+        };
+        let (first, last) = (Self::leaf(start), Self::leaf(end));
+        (first..=last)
             .map(|paragraph| {
                 let text = &paragraphs[paragraph as usize].text;
-                let from = if paragraph == start.paragraph {
+                let from = if paragraph == first {
                     start.scalar_offset as usize
                 } else {
                     0
                 };
-                let to = if paragraph == end.paragraph {
+                let to = if paragraph == last {
                     end.scalar_offset as usize
                 } else {
                     text.chars().count()
@@ -668,6 +723,15 @@ impl NativeEditor {
         // editor's current selection. This check precedes all core mutations.
         Self::check_body_text_span(core, selection)?;
         let (start, end) = Self::ordered(selection);
+        if !start.cell_path.is_empty() {
+            if start != end {
+                Self::delete_in_container(core, start, end)?;
+            }
+            if !text.is_empty() {
+                Self::insert_in_container(core, start, text)?;
+            }
+            return Ok(());
+        }
         if start.paragraph == end.paragraph
             && end.scalar_offset - start.scalar_offset <= 8
             && text.chars().count() <= 8
@@ -751,5 +815,672 @@ impl NativeEditor {
             history_changed,
             composition_id: self.composition_id(),
         }
+    }
+}
+
+/// Containers: a position's paragraph list is the section body when its cell
+/// path is empty, else the paragraphs of the innermost addressed cell. Edits
+/// dispatch to the core's body or `_by_path` cell methods accordingly.
+impl NativeEditor {
+    /// The position's paragraph index within its container.
+    pub(super) fn leaf(position: &NativeTextPosition) -> u32 {
+        position
+            .cell_path
+            .last()
+            .map_or(position.paragraph, |entry| entry.paragraph)
+    }
+
+    /// `position` moved to `offset` in paragraph `paragraph` of the same container.
+    pub(super) fn at_leaf(
+        position: &NativeTextPosition,
+        paragraph: u32,
+        offset: u32,
+    ) -> NativeTextPosition {
+        let mut moved = position.clone();
+        match moved.cell_path.last_mut() {
+            Some(entry) => entry.paragraph = paragraph,
+            None => moved.paragraph = paragraph,
+        }
+        moved.scalar_offset = offset;
+        moved
+    }
+
+    pub(super) fn same_container(a: &NativeTextPosition, b: &NativeTextPosition) -> bool {
+        a.section == b.section
+            && match (a.cell_path.split_last(), b.cell_path.split_last()) {
+                (None, None) => true,
+                (Some((a_leaf, a_prefix)), Some((b_leaf, b_prefix))) => {
+                    a.paragraph == b.paragraph
+                        && a_prefix == b_prefix
+                        && (a_leaf.control, a_leaf.cell) == (b_leaf.control, b_leaf.cell)
+                }
+                _ => false,
+            }
+    }
+
+    /// The paragraphs of the container holding `position`.
+    pub(super) fn container<'a>(
+        core: &'a DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<&'a [Paragraph], NativeHostError> {
+        let outside =
+            || NativeHostError::InvalidArgument("text position is outside the document".into());
+        let mut paragraphs: &[Paragraph] = &core
+            .document()
+            .sections
+            .get(position.section as usize)
+            .ok_or_else(outside)?
+            .paragraphs;
+        let mut index = position.paragraph as usize;
+        for entry in &position.cell_path {
+            let Some(Control::Table(table)) = paragraphs
+                .get(index)
+                .and_then(|paragraph| paragraph.controls.get(entry.control as usize))
+            else {
+                return Err(outside());
+            };
+            paragraphs = &table
+                .cells
+                .get(entry.cell as usize)
+                .ok_or_else(outside)?
+                .paragraphs;
+            index = entry.paragraph as usize;
+        }
+        Ok(paragraphs)
+    }
+
+    /// Text of the position's paragraph.
+    pub(super) fn paragraph_text<'a>(
+        core: &'a DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<&'a str, NativeHostError> {
+        Self::container(core, position)?
+            .get(Self::leaf(position) as usize)
+            .map(|paragraph| paragraph.text.as_str())
+            .ok_or_else(|| {
+                NativeHostError::InvalidArgument("text position is outside the document".into())
+            })
+    }
+
+    /// The core's `_by_path` address: (control, cell, cell paragraph) per level.
+    pub(super) fn core_path(position: &NativeTextPosition) -> Vec<(usize, usize, usize)> {
+        position
+            .cell_path
+            .iter()
+            .map(|entry| {
+                (
+                    entry.control as usize,
+                    entry.cell as usize,
+                    entry.paragraph as usize,
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn insert_in_container(
+        core: &mut DocumentCore,
+        position: &NativeTextPosition,
+        text: &str,
+    ) -> Result<(), NativeHostError> {
+        if position.cell_path.is_empty() {
+            core.insert_text_native(
+                position.section as usize,
+                position.paragraph as usize,
+                position.scalar_offset as usize,
+                text,
+            )?;
+        } else {
+            core.insert_text_in_cell_by_path(
+                position.section as usize,
+                position.paragraph as usize,
+                &Self::core_path(position),
+                position.scalar_offset as usize,
+                text,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_in_container(
+        core: &mut DocumentCore,
+        start: &NativeTextPosition,
+        end: &NativeTextPosition,
+    ) -> Result<(), NativeHostError> {
+        if start.cell_path.is_empty() {
+            core.delete_range_native(
+                start.section as usize,
+                start.paragraph as usize,
+                start.scalar_offset as usize,
+                end.paragraph as usize,
+                end.scalar_offset as usize,
+                None,
+            )?;
+        } else {
+            core.delete_range_in_cell_by_path(
+                start.section as usize,
+                start.paragraph as usize,
+                &Self::core_path(start),
+                Self::leaf(start) as usize,
+                start.scalar_offset as usize,
+                Self::leaf(end) as usize,
+                end.scalar_offset as usize,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Splits the position's paragraph at its offset.
+    pub(super) fn split_in_container(
+        core: &mut DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<(), NativeHostError> {
+        if position.cell_path.is_empty() {
+            core.split_paragraph_native(
+                position.section as usize,
+                position.paragraph as usize,
+                position.scalar_offset as usize,
+                None,
+            )?;
+        } else {
+            core.split_paragraph_in_cell_by_path(
+                position.section as usize,
+                position.paragraph as usize,
+                &Self::core_path(position),
+                position.scalar_offset as usize,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Merges the position's paragraph into the previous one.
+    pub(super) fn merge_in_container(
+        core: &mut DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<(), NativeHostError> {
+        if position.cell_path.is_empty() {
+            core.merge_paragraph_native(position.section as usize, position.paragraph as usize)?;
+        } else {
+            core.merge_paragraph_in_cell_by_path(
+                position.section as usize,
+                position.paragraph as usize,
+                &Self::core_path(position),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cell_tests {
+    use super::actions::{NativeAction, NativeQuery};
+    use super::*;
+    use crate::document_core::native_interaction::NativeCellPathEntry;
+    use crate::native_host::commands::NativeEditCommand;
+    use serde_json::json;
+
+    /// A blank document holding a 2x2 table; returns the editor and the
+    /// body paragraph and control index of the table.
+    fn table_editor() -> (NativeEditor, u32, u32) {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&core.create_table_native(0, 0, 0, 2, 2).unwrap()).unwrap();
+        let paragraph = created["paraIdx"].as_u64().unwrap() as u32;
+        let control = created["controlIdx"].as_u64().unwrap() as u32;
+        let start = NativeTextPosition {
+            section: 0,
+            paragraph: 0,
+            scalar_offset: 0,
+            cell_path: Vec::new(),
+        };
+        let editor = NativeEditor::new(
+            NativeDocumentSession::from_core(core),
+            NativeTextSelection {
+                anchor: start.clone(),
+                focus: start,
+            },
+        )
+        .unwrap();
+        (editor, paragraph, control)
+    }
+
+    fn in_cell(
+        paragraph: u32,
+        control: u32,
+        cell: u32,
+        cell_paragraph: u32,
+        offset: u32,
+    ) -> NativeTextPosition {
+        NativeTextPosition {
+            section: 0,
+            paragraph,
+            scalar_offset: offset,
+            cell_path: vec![NativeCellPathEntry {
+                control,
+                cell,
+                paragraph: cell_paragraph,
+            }],
+        }
+    }
+
+    fn caret(editor: &mut NativeEditor, position: NativeTextPosition) {
+        let revision = editor.session().revision();
+        editor
+            .set_selection(
+                revision,
+                NativeTextSelection {
+                    anchor: position.clone(),
+                    focus: position,
+                },
+            )
+            .unwrap();
+    }
+
+    fn type_text(editor: &mut NativeEditor, text: &str) {
+        let revision = editor.session().revision();
+        editor.replace_selection(revision, text).unwrap();
+    }
+
+    fn command(editor: &mut NativeEditor, command: serde_json::Value) {
+        let revision = editor.session().revision();
+        let command: NativeEditCommand = serde_json::from_value(command).unwrap();
+        editor.execute_command(revision, command).unwrap();
+    }
+
+    fn cell_texts(editor: &NativeEditor, paragraph: u32, control: u32, cell: u32) -> Vec<String> {
+        let position = in_cell(paragraph, control, cell, 0, 0);
+        NativeEditor::container(editor.session().document(), &position)
+            .unwrap()
+            .iter()
+            .map(|paragraph| paragraph.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn typing_splitting_and_joining_stay_inside_the_cell() {
+        let (mut editor, paragraph, control) = table_editor();
+        caret(&mut editor, in_cell(paragraph, control, 1, 0, 0));
+        type_text(&mut editor, "가나");
+        command(&mut editor, json!({"command": "splitParagraph"}));
+        type_text(&mut editor, "다");
+        assert_eq!(cell_texts(&editor, paragraph, control, 1), ["가나", "다"]);
+        assert_eq!(cell_texts(&editor, paragraph, control, 0), [""]);
+        assert_eq!(
+            editor.selection().focus,
+            in_cell(paragraph, control, 1, 1, 1)
+        );
+        command(&mut editor, json!({"command": "moveLeft"}));
+        command(&mut editor, json!({"command": "deleteBackward"}));
+        assert_eq!(cell_texts(&editor, paragraph, control, 1), ["가나다"]);
+        assert_eq!(
+            editor.selection().focus,
+            in_cell(paragraph, control, 1, 0, 2)
+        );
+        // Backspace at the start of a cell does not leave it.
+        caret(&mut editor, in_cell(paragraph, control, 1, 0, 0));
+        command(&mut editor, json!({"command": "deleteBackward"}));
+        assert_eq!(cell_texts(&editor, paragraph, control, 1), ["가나다"]);
+        let revision = editor.session().revision();
+        editor.undo(revision).unwrap();
+        assert_eq!(cell_texts(&editor, paragraph, control, 1), ["가나", "다"]);
+    }
+
+    #[test]
+    fn select_all_in_a_cell_selects_the_cell_and_cut_empties_it() {
+        let (mut editor, paragraph, control) = table_editor();
+        caret(&mut editor, in_cell(paragraph, control, 2, 0, 0));
+        type_text(&mut editor, "셀");
+        command(&mut editor, json!({"command": "selectAll"}));
+        let revision = editor.session().revision();
+        let (payload, _) = editor.cut_selection(revision).unwrap();
+        assert_eq!(payload.plain_text, "셀");
+        assert_eq!(cell_texts(&editor, paragraph, control, 2), [""]);
+        let revision = editor.session().revision();
+        editor.paste_text(revision, "첫\n둘").unwrap();
+        assert_eq!(cell_texts(&editor, paragraph, control, 2), ["첫", "둘"]);
+    }
+
+    #[test]
+    fn a_selection_cannot_cross_cells() {
+        let (mut editor, paragraph, control) = table_editor();
+        let revision = editor.session().revision();
+        let error = editor
+            .set_selection(
+                revision,
+                NativeTextSelection {
+                    anchor: in_cell(paragraph, control, 0, 0, 0),
+                    focus: in_cell(paragraph, control, 1, 0, 0),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, NativeHostError::Unsupported(_)));
+    }
+
+    #[test]
+    fn formatting_and_find_work_in_cells() {
+        let (mut editor, paragraph, control) = table_editor();
+        caret(&mut editor, in_cell(paragraph, control, 3, 0, 0));
+        type_text(&mut editor, "표 안 글자");
+        let revision = editor.session().revision();
+        editor
+            .set_selection(
+                revision,
+                NativeTextSelection {
+                    anchor: in_cell(paragraph, control, 3, 0, 0),
+                    focus: in_cell(paragraph, control, 3, 0, 1),
+                },
+            )
+            .unwrap();
+        let revision = editor.session().revision();
+        let action: NativeAction =
+            serde_json::from_value(json!({"action": "charFormat", "props": {"bold": true}}))
+                .unwrap();
+        editor.apply_action(revision, action).unwrap();
+        let action: NativeAction = serde_json::from_value(
+            json!({"action": "paraFormat", "props": {"alignment": "center"}}),
+        )
+        .unwrap();
+        let revision = editor.session().revision();
+        editor.apply_action(revision, action).unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::CharProperties {}).unwrap()["bold"],
+            json!(true)
+        );
+        assert_eq!(
+            editor.query(NativeQuery::ParaProperties {}).unwrap()["alignment"],
+            json!("center")
+        );
+
+        caret(
+            &mut editor,
+            NativeTextPosition {
+                section: 0,
+                paragraph: 0,
+                scalar_offset: 0,
+                cell_path: Vec::new(),
+            },
+        );
+        let hit = editor
+            .query(NativeQuery::Find {
+                query: "글자".into(),
+                forward: true,
+                case_sensitive: true,
+            })
+            .unwrap();
+        assert_eq!(hit["found"], json!(true));
+        let position: NativeTextPosition = serde_json::from_value(hit["position"].clone()).unwrap();
+        assert_eq!(position, in_cell(paragraph, control, 3, 0, 4));
+    }
+
+    fn act(editor: &mut NativeEditor, action: serde_json::Value) {
+        let revision = editor.session().revision();
+        let action: NativeAction = serde_json::from_value(action).unwrap();
+        editor.apply_action(revision, action).unwrap();
+    }
+
+    fn shape(editor: &NativeEditor, paragraph: u32, control: u32) -> (u16, u16, usize) {
+        match &editor.session().document().document().sections[0].paragraphs[paragraph as usize]
+            .controls[control as usize]
+        {
+            Control::Table(table) => (table.row_count, table.col_count, table.cells.len()),
+            _ => panic!("not a table"),
+        }
+    }
+
+    #[test]
+    fn insert_table_puts_the_caret_in_its_first_cell() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        let start = NativeTextPosition {
+            section: 0,
+            paragraph: 0,
+            scalar_offset: 0,
+            cell_path: Vec::new(),
+        };
+        let mut editor = NativeEditor::new(
+            NativeDocumentSession::from_core(core),
+            NativeTextSelection {
+                anchor: start.clone(),
+                focus: start,
+            },
+        )
+        .unwrap();
+        act(
+            &mut editor,
+            json!({"action": "insertTable", "rows": 3, "cols": 2}),
+        );
+        let focus = editor.selection().focus.clone();
+        assert_eq!(focus.cell_path.len(), 1);
+        assert_eq!(focus.cell_path[0].cell, 0);
+        let (paragraph, control) = (focus.paragraph, focus.cell_path[0].control);
+        assert_eq!(shape(&editor, paragraph, control), (3, 2, 6));
+        type_text(&mut editor, "첫 칸");
+        assert_eq!(cell_texts(&editor, paragraph, control, 0), ["첫 칸"]);
+        let revision = editor.session().revision();
+        editor.undo(revision).unwrap();
+        editor.undo(editor.session().revision()).unwrap();
+        assert!(!editor.session().document().document().sections[0]
+            .paragraphs
+            .iter()
+            .any(|paragraph| paragraph
+                .controls
+                .iter()
+                .any(|control| matches!(control, Control::Table(_)))));
+    }
+
+    #[test]
+    fn rows_and_columns_insert_and_delete_around_the_caret() {
+        let (mut editor, paragraph, control) = table_editor();
+        // Cell 3 is row 1, column 1 of the 2x2 table.
+        caret(&mut editor, in_cell(paragraph, control, 3, 0, 0));
+        type_text(&mut editor, "끝");
+        act(&mut editor, json!({"action": "insertRow", "below": false}));
+        assert_eq!(shape(&editor, paragraph, control), (3, 2, 6));
+        act(
+            &mut editor,
+            json!({"action": "insertColumn", "right": true}),
+        );
+        assert_eq!(shape(&editor, paragraph, control), (3, 3, 9));
+        // The caret stays in the cell that holds the text.
+        let focus = editor.selection().focus.clone();
+        assert_eq!(
+            cell_texts(&editor, paragraph, control, focus.cell_path[0].cell),
+            ["끝"]
+        );
+        act(&mut editor, json!({"action": "deleteRow"}));
+        act(&mut editor, json!({"action": "deleteColumn"}));
+        assert_eq!(shape(&editor, paragraph, control), (2, 2, 4));
+        act(
+            &mut editor,
+            json!({"action": "insertRow", "below": true, "count": 3}),
+        );
+        assert_eq!(shape(&editor, paragraph, control), (5, 2, 10));
+        let revision = editor.session().revision();
+        editor.undo(revision).unwrap();
+        assert_eq!(shape(&editor, paragraph, control), (2, 2, 4));
+    }
+
+    #[test]
+    fn merge_split_and_delete_table() {
+        let (mut editor, paragraph, control) = table_editor();
+        caret(&mut editor, in_cell(paragraph, control, 0, 0, 0));
+        act(&mut editor, json!({"action": "mergeRight"}));
+        assert_eq!(shape(&editor, paragraph, control).2, 3);
+        // The merged cell spans both columns, so merging down takes both cells
+        // below it: the merge stays a rectangle.
+        act(&mut editor, json!({"action": "mergeDown"}));
+        assert_eq!(shape(&editor, paragraph, control).2, 1);
+        act(
+            &mut editor,
+            json!({"action": "splitCell", "rows": 1, "cols": 3}),
+        );
+        assert!(shape(&editor, paragraph, control).2 > 2);
+        act(&mut editor, json!({"action": "deleteTable"}));
+        assert!(editor.selection().focus.cell_path.is_empty());
+        assert!(
+            editor.session().document().document().sections[0].paragraphs[paragraph as usize]
+                .controls
+                .get(control as usize)
+                .is_none_or(|control| !matches!(control, Control::Table(_)))
+        );
+    }
+
+    #[test]
+    fn tab_moves_between_cells_and_adds_a_row_after_the_last() {
+        let (mut editor, paragraph, control) = table_editor();
+        caret(&mut editor, in_cell(paragraph, control, 2, 0, 0));
+        command(&mut editor, json!({"command": "nextCell"}));
+        assert_eq!(
+            editor.selection().focus,
+            in_cell(paragraph, control, 3, 0, 0)
+        );
+        command(&mut editor, json!({"command": "previousCell"}));
+        assert_eq!(
+            editor.selection().focus,
+            in_cell(paragraph, control, 2, 0, 0)
+        );
+        caret(&mut editor, in_cell(paragraph, control, 0, 0, 0));
+        command(&mut editor, json!({"command": "previousCell"}));
+        assert_eq!(
+            editor.selection().focus,
+            in_cell(paragraph, control, 0, 0, 0)
+        );
+        caret(&mut editor, in_cell(paragraph, control, 3, 0, 0));
+        command(&mut editor, json!({"command": "nextCell"}));
+        assert_eq!(shape(&editor, paragraph, control), (3, 2, 6));
+        assert_eq!(
+            editor.selection().focus,
+            in_cell(paragraph, control, 4, 0, 0)
+        );
+    }
+
+    #[test]
+    fn saving_as_hwp_with_the_caret_in_a_cell_works() {
+        let (mut editor, paragraph, control) = table_editor();
+        caret(&mut editor, in_cell(paragraph, control, 1, 0, 0));
+        type_text(&mut editor, "셀");
+        for format in [
+            crate::native_host::save::NativeSaveFormat::Hwp,
+            crate::native_host::save::NativeSaveFormat::Hwpx,
+        ] {
+            let prepared = editor.prepare_save(format).unwrap();
+            editor.cancel_save(prepared.token()).unwrap();
+        }
+    }
+
+    #[test]
+    fn split_table_and_attach_it_again() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&core.create_table_native(0, 0, 0, 3, 2).unwrap()).unwrap();
+        let paragraph = created["paraIdx"].as_u64().unwrap() as u32;
+        let control = created["controlIdx"].as_u64().unwrap() as u32;
+        let start = in_cell(paragraph, control, 0, 0, 0);
+        let mut editor = NativeEditor::new(
+            NativeDocumentSession::from_core(core),
+            NativeTextSelection {
+                anchor: start.clone(),
+                focus: start,
+            },
+        )
+        .unwrap();
+        // Row 1, column 1: cell 3 of the 3x2 table.
+        caret(&mut editor, in_cell(paragraph, control, 3, 0, 0));
+        act(&mut editor, json!({"action": "splitTable"}));
+        assert_eq!(shape(&editor, paragraph, control), (1, 2, 2));
+        let focus = editor.selection().focus.clone();
+        assert_eq!(focus.paragraph, paragraph + 2);
+        let below = (focus.paragraph, focus.cell_path[0].control);
+        assert_eq!(shape(&editor, below.0, below.1), (2, 2, 4));
+        assert_eq!(focus.cell_path[0].cell, 1);
+        caret(&mut editor, in_cell(paragraph, control, 0, 0, 0));
+        act(&mut editor, json!({"action": "attachNextTable"}));
+        assert_eq!(shape(&editor, paragraph, control), (3, 2, 6));
+    }
+}
+
+#[cfg(test)]
+mod object_paragraph_tests {
+    use super::*;
+
+    /// 1×1 PNG.
+    const PNG: [u8; 67] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn at(offset: u32) -> NativeTextPosition {
+        NativeTextPosition {
+            section: 0,
+            paragraph: 0,
+            scalar_offset: offset,
+            cell_path: Vec::new(),
+        }
+    }
+
+    fn range(anchor: u32, focus: u32) -> NativeTextSelection {
+        NativeTextSelection {
+            anchor: at(anchor),
+            focus: at(focus),
+        }
+    }
+
+    /// "가나다라" with a floating picture anchored at offset 2.
+    fn editor_with_picture() -> NativeEditor {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.insert_text_native(0, 0, 0, "가나다라").unwrap();
+        core.insert_picture_native(0, 0, 2, &[], &PNG, 7500, 7500, 1, 1, "png", "", None, None)
+            .unwrap();
+        NativeEditor::new(NativeDocumentSession::from_core(core), range(0, 0)).unwrap()
+    }
+
+    fn text(editor: &NativeEditor) -> &str {
+        &editor.session().document().document().sections[0].paragraphs[0].text
+    }
+
+    fn has_picture(editor: &NativeEditor) -> bool {
+        editor.session().document().document().sections[0].paragraphs[0]
+            .controls
+            .iter()
+            .any(|control| matches!(control, Control::Picture(_)))
+    }
+
+    fn replace(
+        editor: &mut NativeEditor,
+        selection: NativeTextSelection,
+        text: &str,
+    ) -> Result<NativeEditOutcome, NativeHostError> {
+        let revision = editor.session().revision();
+        editor.set_selection(revision, selection)?;
+        let revision = editor.session().revision();
+        editor.replace_selection(revision, text)
+    }
+
+    #[test]
+    fn typing_and_deleting_around_a_floating_picture_keeps_it() {
+        let mut editor = editor_with_picture();
+        replace(&mut editor, range(4, 4), "마").unwrap();
+        replace(&mut editor, range(0, 1), "").unwrap();
+        // The picture sits before 다 (offset 1 now); deleting up to it keeps it.
+        replace(&mut editor, range(0, 1), "").unwrap();
+        assert_eq!(text(&editor), "다라마");
+        assert!(has_picture(&editor));
+    }
+
+    #[test]
+    fn deleting_across_the_picture_anchor_is_refused_without_change() {
+        let mut editor = editor_with_picture();
+        let revision = editor.session().revision();
+        let error = replace(&mut editor, range(1, 3), "").unwrap_err();
+        assert!(matches!(error, NativeHostError::Unsupported(_)));
+        assert_eq!(text(&editor), "가나다라");
+        assert!(has_picture(&editor));
+        assert_eq!(editor.session().revision(), revision);
     }
 }

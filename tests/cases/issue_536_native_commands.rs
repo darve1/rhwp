@@ -1,4 +1,6 @@
 //! Native command content/history contracts, not a claim of visual parity.
+//! 주석 갱신: 2026-11-10T02:25:00+09:00; 직전 파일 커밋: 2026-11-08T19:09:35+09:00 (c9095c5f67632e6721e800ccc7fb43ea49d26682).
+//! 객체가 든 문단의 편집 계약: 글자 편집은 객체를 지우지 않는 한 허용하고 객체를 보존한다.
 #![cfg(not(target_arch = "wasm32"))]
 
 use rhwp::document_core::native_interaction::{
@@ -495,39 +497,41 @@ fn native_commands_floating_middle_object_rejects_all_body_mutations() {
     assert!(!editor.can_undo());
 }
 
+/// Joining into a paragraph that holds a floating object moves text only:
+/// the object stays, and undo restores both paragraphs.
 #[test]
-fn native_commands_join_checks_previous_paragraph_outside_collapsed_selection() {
-    let mut core = core(&["A", "B"]);
-    let mut document = core.document().clone();
-    let mut table = Table::default();
-    table.common.treat_as_char = false;
-    document.sections[0].paragraphs[0]
-        .controls
-        .push(Control::Table(Box::new(table)));
-    core.set_document(document);
-    let range = caret(1, 0);
-    let mut editor =
-        NativeEditor::new(NativeDocumentSession::from_core(core), range.clone()).unwrap();
-    editor.replace_selection(0, "x").unwrap();
-    editor.undo(1).unwrap();
-    let revision = editor.session().revision();
-    let before = format!("{:?}", editor.session().document().document());
+fn native_commands_join_keeps_the_floating_object_of_the_previous_paragraph() {
     for command in [
         Command::JoinPreviousParagraph {},
         Command::DeleteBackward {},
     ] {
-        assert!(matches!(
-            editor.execute_command(revision, command),
-            Err(NativeHostError::Unsupported(_))
-        ));
+        let mut core = core(&["A", "B"]);
+        let mut document = core.document().clone();
+        let mut table = Table::default();
+        table.common.treat_as_char = false;
+        document.sections[0].paragraphs[0]
+            .controls
+            .push(Control::Table(Box::new(table)));
+        core.set_document(document);
+        let mut editor =
+            NativeEditor::new(NativeDocumentSession::from_core(core), caret(1, 0)).unwrap();
+        let before = format!("{:?}", editor.session().document().document());
+        let revision = editor.session().revision();
+        editor.execute_command(revision, command).unwrap();
+        let paragraphs = &editor.session().document().document().sections[0].paragraphs;
+        assert_eq!(paragraphs.len(), 1);
+        assert_eq!(paragraphs[0].text, "AB");
+        assert!(paragraphs[0]
+            .controls
+            .iter()
+            .any(|control| matches!(control, Control::Table(_))));
+        assert_eq!(editor.selection(), &caret(0, 1));
+        let revision = editor.session().revision();
+        editor.undo(revision).unwrap();
         assert_eq!(
             format!("{:?}", editor.session().document().document()),
             before
         );
-        assert_eq!(editor.selection(), &range);
-        assert_eq!(editor.session().revision(), revision);
-        assert!(editor.can_redo());
-        assert!(!editor.can_undo());
     }
 }
 
@@ -546,23 +550,26 @@ fn native_commands_split_at_semantic_paragraph_caret_preserves_redo() {
     let revision = editor.session().revision();
     let range = caret(1, 1);
     select(&mut editor, range.clone());
-    let before = format!("{:?}", editor.session().document().document());
-    assert!(matches!(
-        editor.execute_command(revision, Command::SplitParagraph {}),
-        Err(NativeHostError::Unsupported(_))
-    ));
-    assert_eq!(
-        format!("{:?}", editor.session().document().document()),
-        before
-    );
-    assert_eq!(editor.selection(), &range);
-    assert_eq!(editor.session().revision(), revision);
-    assert!(editor.can_redo());
-    assert!(!editor.can_undo());
+    // Splitting removes no text, so it is allowed and the bookmark survives.
+    editor
+        .execute_command(revision, Command::SplitParagraph {})
+        .unwrap();
+    let paragraphs = &editor.session().document().document().sections[0].paragraphs;
+    assert_eq!(paragraphs.len(), 3);
+    let bookmarks = paragraphs
+        .iter()
+        .flat_map(|paragraph| &paragraph.controls)
+        .filter(|control| matches!(control, Control::Bookmark(_)))
+        .count();
+    assert_eq!(bookmarks, 1);
+    assert_eq!(editor.selection(), &caret(2, 0));
+    // A new action replaces the redo stack.
+    assert!(!editor.can_redo());
+    assert!(editor.can_undo());
 }
 
 #[test]
-fn native_commands_semantic_control_paragraph_allows_selection_and_identical_text() {
+fn native_commands_semantic_control_paragraph_allows_selection_identical_text_and_typing() {
     let mut core = core(&["A"]);
     let mut document = core.document().clone();
     document.sections[0].paragraphs[0]
@@ -581,16 +588,19 @@ fn native_commands_semantic_control_paragraph_allows_selection_and_identical_tex
         },
     );
     assert_eq!(editor.selection(), &caret(0, 0));
-    assert!(matches!(
-        editor.replace_selection(0, "B"),
-        Err(NativeHostError::Unsupported(_))
-    ));
     assert_eq!(
         format!("{:?}", editor.session().document().document()),
         before
     );
-    assert_eq!(editor.session().revision(), 0);
-    assert!(!editor.can_undo());
+    // Typing removes nothing, so it is allowed and keeps the bookmark.
+    editor.replace_selection(0, "B").unwrap();
+    let paragraph = &editor.session().document().document().sections[0].paragraphs[0];
+    assert_eq!(paragraph.text, "BA");
+    assert!(paragraph
+        .controls
+        .iter()
+        .any(|control| matches!(control, Control::Bookmark(_))));
+    assert!(editor.can_undo());
 }
 
 #[test]
