@@ -42,6 +42,16 @@ pub enum NativeAction {
     /// second part starts a new page (column). Body text only.
     InsertPageBreak {},
     InsertColumnBreak {},
+    /// 다단: columns of the caret's section. `kind` 0 normal, 1 distribute,
+    /// 2 parallel; `spacing` between columns in HWPUNIT.
+    SetColumns {
+        count: u16,
+        #[serde(default)]
+        kind: u8,
+        #[serde(default = "same_width")]
+        same_width: bool,
+        spacing: i16,
+    },
     /// Page setup of the caret's section, as rhwp's PageDef JSON (HWPUNIT).
     SetPageDef {
         props: Value,
@@ -149,6 +159,11 @@ pub enum NativeQuery {
     ParaProperties {},
     /// Page setup (PageDef) of the section holding the selection start.
     PageDef {},
+    /// `{"count","kind","sameWidth","spacing"}`: that section's columns.
+    Columns {},
+    /// `{"sections":[html…]}`: each section's body as the clipboard HTML
+    /// fragment, which the web editor's HTML and Word (.doc) export wraps.
+    DocumentHtml {},
     /// The link at the selection start, `{"fieldId","start","end","text","uri"}`, or null.
     Hyperlink {},
     /// `{"styles":[{"id","name","englishName","type"}],"current":id}`: the
@@ -395,6 +410,29 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::SetColumns {
+                count,
+                kind,
+                same_width,
+                spacing,
+            } => {
+                if !(1..=255).contains(&count) || kind > 2 {
+                    return Err(NativeHostError::InvalidArgument(
+                        "columns: 1–255, kind 0–2".into(),
+                    ));
+                }
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    core.set_column_def_native(
+                        selection.focus.section as usize,
+                        count,
+                        kind,
+                        same_width,
+                        spacing,
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::SetPageDef { props } => {
                 let props = props.to_string();
                 let outcome = self.action_transaction(expected_revision, |core, selection| {
@@ -543,6 +581,34 @@ impl NativeEditor {
                 &Self::core_path(&start),
             )?),
             NativeQuery::PageDef {} => parse(&core.get_page_def_native(start.section as usize)?),
+            NativeQuery::DocumentHtml {} => {
+                let mut sections = Vec::new();
+                for (index, section) in core.document().sections.iter().enumerate() {
+                    let Some(last) = section.paragraphs.len().checked_sub(1) else {
+                        continue;
+                    };
+                    let end = section.paragraphs[last].text.chars().count();
+                    sections.push(core.export_selection_html_native(index, 0, 0, last, end)?);
+                }
+                Ok(json!({ "sections": sections }))
+            }
+            NativeQuery::Columns {} => {
+                use crate::model::page::ColumnType;
+                let columns = DocumentCore::find_initial_column_def(
+                    &core.document().sections[start.section as usize].paragraphs,
+                );
+                let kind = match columns.column_type {
+                    ColumnType::Normal => 0,
+                    ColumnType::Distribute => 1,
+                    ColumnType::Parallel => 2,
+                };
+                Ok(json!({
+                    "count": columns.column_count.max(1),
+                    "kind": kind,
+                    "sameWidth": columns.same_width,
+                    "spacing": columns.spacing,
+                }))
+            }
             NativeQuery::Styles {} => {
                 let styles: Vec<Value> = core
                     .document()
@@ -821,6 +887,10 @@ fn link_target(position: &NativeTextPosition) -> crate::document_core::hyperlink
         para: position.paragraph as usize,
         cell_path: NativeEditor::core_path(position),
     }
+}
+
+fn same_width() -> bool {
+    true
 }
 
 fn one() -> u16 {
@@ -1500,5 +1570,41 @@ mod tests {
             before
         );
         assert_eq!(text(&editor), "제목");
+    }
+
+    #[test]
+    fn two_columns_set_and_read_back() {
+        let mut editor = editor("다단", selected(0, 0));
+        assert_eq!(
+            editor.query(NativeQuery::Columns {}).unwrap()["count"],
+            json!(1)
+        );
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "setColumns", "count": 2, "spacing": 2268})),
+            )
+            .unwrap();
+        let columns = editor.query(NativeQuery::Columns {}).unwrap();
+        assert_eq!(
+            (columns["count"].clone(), columns["spacing"].clone()),
+            (json!(2), json!(2268))
+        );
+        let revision = current_revision(&editor);
+        editor.undo(revision).unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::Columns {}).unwrap()["count"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn document_html_has_the_text_of_every_section() {
+        let mut editor = editor("내보낼 글", selected(0, 0));
+        let html = editor.query(NativeQuery::DocumentHtml {}).unwrap();
+        let sections = html["sections"].as_array().unwrap();
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].as_str().unwrap().contains("내보낼 글"));
     }
 }
