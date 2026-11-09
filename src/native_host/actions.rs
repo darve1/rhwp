@@ -134,6 +134,39 @@ pub enum NativeAction {
     AddBookmark {
         name: String,
     },
+    /// A picture floating at a body-text caret, as 한글 inserts one: anchored
+    /// to the caret's paragraph, placed where the caret is on the page.
+    /// `data` is the image file in base64; sizes are HWPUNIT and pixels.
+    InsertPicture {
+        data: String,
+        extension: String,
+        width: u32,
+        height: u32,
+        natural_width: u32,
+        natural_height: u32,
+    },
+    /// Deletes the picture, shape or table control `control` of body
+    /// paragraph `paragraph` (as listed by `pageObjects`).
+    DeleteObject {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+    },
+    /// Picture properties (`width`, `height`, `rotationAngle`, `horzFlip`,
+    /// `vertFlip`, …) of a picture control.
+    SetPictureProperties {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+        props: Value,
+    },
+    /// Stacking order of a picture or shape: front, back, forward, backward.
+    ObjectOrder {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+        operation: String,
+    },
     /// The document style `id` on every paragraph the selection touches
     /// (body text or top-level table cells).
     ApplyStyle {
@@ -159,6 +192,15 @@ pub enum NativeQuery {
     ParaProperties {},
     /// Page setup (PageDef) of the section holding the selection start.
     PageDef {},
+    /// The objects laid out on page `page` with their page boxes (layout
+    /// pixels) and addresses: the core's page control layout.
+    PageObjects { page: u32 },
+    /// Properties of a picture control.
+    PictureProperties {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+    },
     /// `{"count","kind","sameWidth","spacing"}`: that section's columns.
     Columns {},
     /// `{"sections":[html…]}`: each section's body as the clipboard HTML
@@ -381,6 +423,154 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::InsertPicture {
+                data,
+                extension,
+                width,
+                height,
+                natural_width,
+                natural_height,
+            } => {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data.as_bytes())
+                    .map_err(|_| {
+                        NativeHostError::InvalidArgument("picture data is not base64".into())
+                    })?;
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let caret = &selection.focus;
+                    if !caret.cell_path.is_empty() {
+                        return Err(NativeHostError::Unsupported(
+                            "pictures are inserted in body text".into(),
+                        ));
+                    }
+                    // The caret's place on its page, in HWPUNIT (75 per layout pixel).
+                    let rect = core.native_caret_rect(caret)?;
+                    let to_units = |pixels: f64| (pixels * 75.0).round() as i32;
+                    core.insert_picture_native(
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        caret.scalar_offset as usize,
+                        &[],
+                        &bytes,
+                        width,
+                        height,
+                        natural_width,
+                        natural_height,
+                        &extension,
+                        "",
+                        Some(to_units(rect.x)),
+                        Some(to_units(rect.y)),
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::DeleteObject {
+                section,
+                paragraph,
+                control,
+            } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let (s, p, c) = (section as usize, paragraph as usize, control as usize);
+                    let kind = match core
+                        .document()
+                        .sections
+                        .get(s)
+                        .and_then(|section| section.paragraphs.get(p))
+                        .and_then(|paragraph| paragraph.controls.get(c))
+                    {
+                        Some(Control::Picture(_)) => 0,
+                        Some(Control::Shape(_)) => 1,
+                        Some(Control::Table(_)) => 2,
+                        _ => {
+                            return Err(NativeHostError::Unsupported(
+                                "only pictures, shapes and tables can be deleted as objects".into(),
+                            ))
+                        }
+                    };
+                    match kind {
+                        0 => core.delete_picture_control_native(s, p, c)?,
+                        1 => core.delete_shape_control_native(s, p, c)?,
+                        _ => core.delete_table_control_native(s, p, c)?,
+                    };
+                    // The caret's offsets stay valid; fall back to the paragraph start.
+                    Ok(if Self::validate_selection(core, selection).is_ok() {
+                        selection.clone()
+                    } else {
+                        let start = NativeTextPosition {
+                            section,
+                            paragraph,
+                            scalar_offset: 0,
+                            cell_path: Vec::new(),
+                        };
+                        NativeTextSelection {
+                            anchor: start.clone(),
+                            focus: start,
+                        }
+                    })
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::SetPictureProperties {
+                section,
+                paragraph,
+                control,
+                props,
+            } => {
+                let props = props.to_string();
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    core.set_picture_properties_native(
+                        section as usize,
+                        paragraph as usize,
+                        control as usize,
+                        &props,
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::ObjectOrder {
+                section,
+                paragraph,
+                control,
+                operation,
+            } => {
+                if !matches!(
+                    operation.as_str(),
+                    "front" | "back" | "forward" | "backward"
+                ) {
+                    return Err(NativeHostError::InvalidArgument(
+                        "order: front, back, forward, backward".into(),
+                    ));
+                }
+                let is_shape = matches!(
+                    self.session
+                        .core
+                        .document()
+                        .sections
+                        .get(section as usize)
+                        .and_then(|s| s.paragraphs.get(paragraph as usize))
+                        .and_then(|p| p.controls.get(control as usize)),
+                    Some(Control::Shape(_))
+                );
+                if !is_shape {
+                    // The web editor orders shapes only, too.
+                    return Err(NativeHostError::Unsupported(
+                        "stacking order applies to shapes".into(),
+                    ));
+                }
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    core.change_shape_z_order_native(
+                        section as usize,
+                        paragraph as usize,
+                        control as usize,
+                        &operation,
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::ApplyStyle { id } => {
                 let outcome = self.action_transaction(expected_revision, |core, selection| {
                     let (start, end) = Self::ordered(selection);
@@ -592,6 +782,16 @@ impl NativeEditor {
                 }
                 Ok(json!({ "sections": sections }))
             }
+            NativeQuery::PageObjects { page } => parse(&core.get_page_control_layout_native(page)?),
+            NativeQuery::PictureProperties {
+                section,
+                paragraph,
+                control,
+            } => parse(&core.get_picture_properties_native(
+                section as usize,
+                paragraph as usize,
+                control as usize,
+            )?),
             NativeQuery::Columns {} => {
                 use crate::model::page::ColumnType;
                 let columns = DocumentCore::find_initial_column_def(
@@ -1606,5 +1806,81 @@ mod tests {
         let sections = html["sections"].as_array().unwrap();
         assert_eq!(sections.len(), 1);
         assert!(sections[0].as_str().unwrap().contains("내보낼 글"));
+    }
+
+    /// 1×1 PNG, base64.
+    const PNG_BASE64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn picture_insert_properties_order_and_delete() {
+        let mut editor = editor("그림 앞뒤", selected(2, 2));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertPicture", "data": PNG_BASE64, "extension": "png",
+                              "width": 7500, "height": 7500, "naturalWidth": 1, "naturalHeight": 1})),
+            )
+            .unwrap();
+        let layout = editor.query(NativeQuery::PageObjects { page: 0 }).unwrap();
+        let picture = layout["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|object| object["type"] == json!("image"))
+            .expect("the picture is laid out on page 1")
+            .clone();
+        let address = |key: &str| picture[key].as_u64().unwrap();
+        let (section, paragraph, control) =
+            (address("secIdx"), address("paraIdx"), address("controlIdx"));
+        assert_eq!((section, paragraph), (0, 0));
+        // Typing next to the floating picture still works.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "새").unwrap();
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "setPictureProperties", "section": section, "paragraph": paragraph,
+                              "control": control, "props": {"width": 15000, "height": 15000}})),
+            )
+            .unwrap();
+        let props = editor
+            .query(NativeQuery::PictureProperties {
+                section: section as u32,
+                paragraph: paragraph as u32,
+                control: control as u32,
+            })
+            .unwrap();
+        assert_eq!(props["width"], json!(15000));
+        // Stacking order is for shapes, as in the web editor.
+        let revision = current_revision(&editor);
+        let refused = editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "objectOrder", "section": section, "paragraph": paragraph,
+                              "control": control, "operation": "front"}),
+                ),
+            )
+            .unwrap_err();
+        assert!(matches!(refused, NativeHostError::Unsupported(_)));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "deleteObject", "section": section, "paragraph": paragraph,
+                              "control": control}),
+                ),
+            )
+            .unwrap();
+        let paragraph_controls =
+            &editor.session().document().document().sections[0].paragraphs[0].controls;
+        assert!(!paragraph_controls
+            .iter()
+            .any(|c| matches!(c, Control::Picture(_))));
+        assert_eq!(text(&editor), "그림새 앞뒤");
     }
 }
