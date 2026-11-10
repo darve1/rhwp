@@ -117,6 +117,166 @@ impl ListWalk {
 }
 
 impl DocumentCore {
+    /// 누름틀 필드의 속성 (웹 래퍼 `getClickHereProps` 와 같은 JSON).
+    pub fn click_here_props_native(&self, field_id: u32) -> String {
+        use crate::model::control::{Control, FieldType};
+        // 문서 전체에서 fieldId로 필드 찾기
+        for sec in &self.document.sections {
+            for para in &sec.paragraphs {
+                for ctrl in &para.controls {
+                    if let Control::Field(f) = ctrl {
+                        if f.field_id == field_id && f.field_type == FieldType::ClickHere {
+                            return Self::format_click_here_props(f);
+                        }
+                    }
+                }
+                // 표/글상자 내부도 탐색
+                for ctrl in &para.controls {
+                    let paras: Vec<&crate::model::paragraph::Paragraph> = match ctrl {
+                        Control::Table(t) => t.cells.iter().flat_map(|c| &c.paragraphs).collect(),
+                        Control::Shape(s) => s
+                            .drawing()
+                            .and_then(|d| d.text_box.as_ref())
+                            .map(|tb| tb.paragraphs.iter().collect())
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    for p in paras {
+                        for c in &p.controls {
+                            if let Control::Field(f) = c {
+                                if f.field_id == field_id && f.field_type == FieldType::ClickHere {
+                                    return Self::format_click_here_props(f);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        r#"{"ok":false}"#.to_string()
+    }
+
+    /// ClickHere 필드 속성을 JSON으로 포맷한다.
+    fn format_click_here_props(f: &crate::model::control::Field) -> String {
+        use crate::document_core::helpers::json_escape;
+        let guide = f.guide_text().unwrap_or("");
+        let memo = f.memo_text().unwrap_or("");
+        // 필드 이름: ctrl_data_name → command Name: 키 순서
+        let name = f
+            .ctrl_data_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| f.extract_wstring_value("Name:"))
+            .unwrap_or("");
+        let editable = f.is_editable_in_form();
+        format!(
+            "{{\"ok\":true,\"guide\":\"{}\",\"memo\":\"{}\",\"name\":\"{}\",\"editable\":{}}}",
+            json_escape(guide),
+            json_escape(memo),
+            json_escape(name),
+            editable,
+        )
+    }
+
+    /// 누름틀 필드의 속성을 고친다 (웹 래퍼 `updateClickHereProps` 와 같은 동작).
+    pub fn update_click_here_props_native(
+        &mut self,
+        field_id: u32,
+        guide: &str,
+        memo: &str,
+        name: &str,
+        editable: bool,
+    ) -> String {
+        use crate::model::control::{Control, Field, FieldType};
+
+        let new_props_bit = if editable { 1u32 } else { 0u32 };
+
+        // 필드를 찾아 수정하고, ctrl_data_records 바이너리도 갱신
+        fn update_field_in_para(
+            para: &mut crate::model::paragraph::Paragraph,
+            field_id: u32,
+            guide: &str,
+            memo: &str,
+            new_props_bit: u32,
+            new_name: &str,
+        ) -> bool {
+            for (ci, ctrl) in para.controls.iter_mut().enumerate() {
+                if let Control::Field(f) = ctrl {
+                    if f.field_id == field_id && f.field_type == FieldType::ClickHere {
+                        // guide/memo가 원본과 동일하면 command 문자열을 보존한다.
+                        // 원본 command에는 trailing space 등이 포함될 수 있으므로
+                        // 불필요한 재구축을 피해야 한컴 호환성이 유지된다.
+                        let orig_guide = f.guide_text().unwrap_or("").to_string();
+                        let orig_memo = f.memo_text().unwrap_or("").to_string();
+                        if guide != orig_guide || memo != orig_memo {
+                            // guide 또는 memo가 변경되었으므로 command 재구축
+                            let new_command = Field::build_clickhere_command(guide, memo);
+                            f.command = new_command;
+                        }
+                        // command가 변경되지 않았으면 원본 보존
+
+                        f.properties = (f.properties & !1) | new_props_bit;
+                        f.ctrl_data_name = if new_name.is_empty() {
+                            None
+                        } else {
+                            Some(new_name.to_string())
+                        };
+                        // ctrl_data_records 바이너리 갱신
+                        crate::document_core::queries::field_query::write_ctrl_data_name(
+                            &mut para.ctrl_data_records,
+                            ci,
+                            new_name,
+                        );
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        for sec in &mut self.document.sections {
+            sec.raw_stream = None;
+            for para in &mut sec.paragraphs {
+                if update_field_in_para(para, field_id, guide, memo, new_props_bit, name) {
+                    self.invalidate_page_tree_cache();
+                    return r#"{"ok":true}"#.to_string();
+                }
+                // 표/글상자 내부
+                for ctrl in &mut para.controls {
+                    let found = match ctrl {
+                        Control::Table(t) => t.cells.iter_mut().any(|c| {
+                            c.paragraphs.iter_mut().any(|p| {
+                                update_field_in_para(p, field_id, guide, memo, new_props_bit, name)
+                            })
+                        }),
+                        Control::Shape(s) => {
+                            if let Some(tb) = s.drawing_mut().and_then(|d| d.text_box.as_mut()) {
+                                tb.paragraphs.iter_mut().any(|p| {
+                                    update_field_in_para(
+                                        p,
+                                        field_id,
+                                        guide,
+                                        memo,
+                                        new_props_bit,
+                                        name,
+                                    )
+                                })
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if found {
+                        self.invalidate_page_tree_cache();
+                        return r#"{"ok":true}"#.to_string();
+                    }
+                }
+            }
+        }
+        r#"{"ok":false}"#.to_string()
+    }
+
     /// 문서 전체에서 모든 필드를 검색하여 목록으로 반환한다.
     pub fn collect_all_fields(&self) -> Vec<FieldInfo> {
         self.collect_fields_and_lists().0

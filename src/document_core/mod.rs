@@ -249,6 +249,8 @@ pub struct DocumentCore {
     pub(crate) show_transparent_borders: bool,
     /// 잘림 보기 (body/셀 클리핑 활성화 여부)
     pub(crate) clip_enabled: bool,
+    /// Native editor 양식 모드: only text inside editable 누름틀 changes.
+    pub(crate) native_form_mode: bool,
     /// 디버그 오버레이 표시 여부 (문단/표 경계 + pi/ci 라벨)
     pub(crate) debug_overlay: bool,
     /// LINE_SEG vpos-reset 강제 분리 적용 여부 (페이지네이션 옵션)
@@ -606,6 +608,7 @@ impl DocumentCore {
             show_control_codes: false,
             show_transparent_borders: false,
             clip_enabled: true,
+            native_form_mode: false,
             debug_overlay: false,
             respect_vpos_reset: false,
             hangul2024_compat: false,

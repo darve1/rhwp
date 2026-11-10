@@ -735,6 +735,7 @@ impl NativeEditor {
     ) -> Result<(), NativeHostError> {
         // Also covers IME previews and command edit ranges distinct from the
         // editor's current selection. This check precedes all core mutations.
+        Self::check_form_mode(core, Some(selection))?;
         Self::check_body_text_span(core, selection)?;
         let (start, end) = Self::ordered(selection);
         if !start.cell_path.is_empty() {
@@ -973,6 +974,23 @@ impl NativeEditor {
             Self::paragraph_at(core, position)?,
             position.scalar_offset as usize,
         );
+        // Text typed at a 누름틀 goes inside it, as in 한글: the core keeps text
+        // in its active field. Any other position has none.
+        core.clear_active_field();
+        if position.cell_path.is_empty() {
+            core.set_active_field(
+                position.section as usize,
+                position.paragraph as usize,
+                offset,
+            );
+        } else {
+            core.set_active_field_by_path(
+                position.section as usize,
+                position.paragraph as usize,
+                &Self::core_path(position),
+                offset,
+            );
+        }
         if position.cell_path.is_empty() {
             core.insert_text_at_caret_native(
                 position.section as usize,
@@ -1037,11 +1055,61 @@ impl NativeEditor {
         Ok(())
     }
 
+    /// 양식 모드 lets text change only inside one 누름틀 that is editable in
+    /// forms; `None` (paragraph splits, joins, actions) is refused outright.
+    pub(super) fn check_form_mode(
+        core: &DocumentCore,
+        selection: Option<&NativeTextSelection>,
+    ) -> Result<(), NativeHostError> {
+        if !core.native_form_mode {
+            return Ok(());
+        }
+        let refused = || {
+            NativeHostError::Unsupported(
+                "in form mode only the text of a click-here field can change".into(),
+            )
+        };
+        let selection = selection.ok_or_else(refused)?;
+        let (start, end) = Self::ordered(selection);
+        if !Self::same_container(start, end) || Self::leaf(start) != Self::leaf(end) {
+            return Err(refused());
+        }
+        let (from, to) = (
+            Self::text_offset(core, start)?,
+            Self::text_offset(core, end)?,
+        );
+        let info = if start.cell_path.is_empty() {
+            core.get_field_info_at(start.section as usize, start.paragraph as usize, from)
+        } else {
+            core.get_field_info_at_by_path(
+                start.section as usize,
+                start.paragraph as usize,
+                &Self::core_path(start),
+                from,
+            )
+        };
+        let info: serde_json::Value = serde_json::from_str(&info).unwrap_or_default();
+        let inside = info["inField"] == true
+            && info["editableInForm"] == true
+            && info["startCharIdx"]
+                .as_u64()
+                .is_some_and(|first| first as usize <= from)
+            && info["endCharIdx"]
+                .as_u64()
+                .is_some_and(|last| to <= last as usize);
+        if inside {
+            Ok(())
+        } else {
+            Err(refused())
+        }
+    }
+
     /// Splits the position's paragraph at its offset.
     pub(super) fn split_in_container(
         core: &mut DocumentCore,
         position: &NativeTextPosition,
     ) -> Result<(), NativeHostError> {
+        Self::check_form_mode(core, None)?;
         if position.cell_path.is_empty() {
             core.split_paragraph_native(
                 position.section as usize,
@@ -1084,6 +1152,7 @@ impl NativeEditor {
         core: &mut DocumentCore,
         position: &NativeTextPosition,
     ) -> Result<(), NativeHostError> {
+        Self::check_form_mode(core, None)?;
         if position.cell_path.is_empty() {
             core.merge_paragraph_native(position.section as usize, position.paragraph as usize)?;
         } else {
@@ -1645,6 +1714,7 @@ mod marks_tests {
             control_codes: false,
             transparent_borders: true,
             clip: false,
+            form_mode: false,
         };
         editor.set_editor_marks(marks);
         assert_eq!(editor.session().editor_marks(), marks);

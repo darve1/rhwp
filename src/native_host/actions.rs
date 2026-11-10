@@ -221,6 +221,25 @@ pub enum NativeAction {
     },
     /// Deletes the footnote or endnote whose marker is at the caret.
     DeleteNote {},
+    /// 누름틀 at a collapsed caret (body or table cell): an empty click-here
+    /// field showing `guide` until something is typed into it.
+    InsertField {
+        guide: String,
+        #[serde(default)]
+        memo: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default = "true_value")]
+        editable: bool,
+    },
+    /// 누름틀 고치기: guide, memo, name and form editability of the click-here
+    /// field around the caret.
+    SetFieldProperties {
+        guide: String,
+        memo: String,
+        name: String,
+        editable: bool,
+    },
     /// 각주 모양 / 미주 모양 (`note` footnote or endnote) of the caret's
     /// section: `numberFormat`, `prefixChar`, `suffixChar`, `startNumber`,
     /// `numbering`, `placement`, ….
@@ -310,6 +329,13 @@ pub enum NativeQuery {
     PageHide {},
     /// The field around a body-text caret, `{"inField":false}` if none.
     FieldInfo {},
+    /// `{"found":false}`, or the click-here field around the caret (body or
+    /// cell): `fieldId`, `guide`, `memo`, `name`, `editable`.
+    ClickHereAtCaret {},
+    /// `{"fields":[{"position","length","name","editable"}]}`: every click-here
+    /// field in body text and top-level table cells, in document order, for
+    /// moving between them in form mode.
+    FormFields {},
     /// 각주 모양 or 미주 모양 of the caret's section.
     NoteShape { note: String },
     /// `{"found":false}`, or the footnote or endnote whose marker is at a
@@ -882,6 +908,71 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::InsertField {
+                guide,
+                memo,
+                name,
+                editable,
+            } => {
+                let mut result = Value::Null;
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    if selection.anchor != selection.focus {
+                        return Err(NativeHostError::Unsupported(
+                            "a field is inserted at a collapsed caret".into(),
+                        ));
+                    }
+                    let caret = &selection.focus;
+                    let offset = Self::text_offset(core, caret)?;
+                    result = parse(&if caret.cell_path.is_empty() {
+                        core.insert_click_here_field_at(
+                            caret.section as usize,
+                            caret.paragraph as usize,
+                            offset,
+                            &guide,
+                            &memo,
+                            &name,
+                            editable,
+                        )?
+                    } else {
+                        core.insert_click_here_field_at_by_path(
+                            caret.section as usize,
+                            caret.paragraph as usize,
+                            &Self::core_path(caret),
+                            offset,
+                            &guide,
+                            &memo,
+                            &name,
+                            editable,
+                        )?
+                    })?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, result))
+            }
+            NativeAction::SetFieldProperties {
+                guide,
+                memo,
+                name,
+                editable,
+            } => {
+                let Some(field) = click_here_at(&self.session.core, &self.selection.focus)? else {
+                    return Err(NativeHostError::InvalidArgument(
+                        "the caret is not in a click-here field".into(),
+                    ));
+                };
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let updated = parse(
+                        &core.update_click_here_props_native(field, &guide, &memo, &name, editable),
+                    )?;
+                    if updated["ok"] != json!(true) {
+                        return Err(NativeHostError::InvalidArgument(
+                            "the click-here field was not found".into(),
+                        ));
+                    }
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::DeleteNote {} => {
                 let caret = self.selection.focus.clone();
                 let Some((control, _)) = note_at(&self.session.core, &caret) else {
@@ -1314,6 +1405,16 @@ impl NativeEditor {
                     Self::text_offset(core, &start)?,
                 ))
             }
+            NativeQuery::FormFields {} => Ok(json!({ "fields": form_fields(core) })),
+            NativeQuery::ClickHereAtCaret {} => Ok(match click_here_at(core, &start)? {
+                None => json!({ "found": false }),
+                Some(field) => {
+                    let mut props = parse(&core.click_here_props_native(field))?;
+                    props["found"] = json!(true);
+                    props["fieldId"] = json!(field);
+                    props
+                }
+            }),
             NativeQuery::NoteShape { note } => parse(&match note.as_str() {
                 "footnote" => core.get_footnote_shape_native(start.section as usize)?,
                 "endnote" => core.get_endnote_shape_native(start.section as usize)?,
@@ -1519,6 +1620,7 @@ impl NativeEditor {
         ) -> Result<NativeTextSelection, NativeHostError>,
     ) -> Result<NativeEditOutcome, NativeHostError> {
         self.check_edit_ready(expected_revision)?;
+        Self::check_form_mode(&self.session.core, None)?;
         self.check_mutation_capacity()?;
         self.check_snapshot_slots(2)?;
         let selection_before = self.selection.clone();
@@ -2144,6 +2246,88 @@ fn set_note_text(
         offset = line.chars().count();
     }
     Ok(())
+}
+
+/// The id of the click-here field around a caret, body or table cell.
+fn click_here_at(
+    core: &DocumentCore,
+    caret: &NativeTextPosition,
+) -> Result<Option<u32>, NativeHostError> {
+    let offset = NativeEditor::text_offset(core, caret)?;
+    let info = parse(&if caret.cell_path.is_empty() {
+        core.get_field_info_at(caret.section as usize, caret.paragraph as usize, offset)
+    } else {
+        core.get_field_info_at_by_path(
+            caret.section as usize,
+            caret.paragraph as usize,
+            &NativeEditor::core_path(caret),
+            offset,
+        )
+    })?;
+    Ok((info["inField"] == json!(true))
+        .then(|| info["fieldId"].as_u64())
+        .flatten()
+        .map(|id| id as u32))
+}
+
+/// Click-here fields of body paragraphs and top-level table cells, as
+/// native ranges in document order.
+fn form_fields(core: &DocumentCore) -> Vec<Value> {
+    use crate::document_core::helpers::text_to_logical_offset;
+    use crate::model::control::FieldType;
+    let mut fields = Vec::new();
+    let mut add = |paragraph: &crate::model::paragraph::Paragraph, position: NativeTextPosition| {
+        for range in &paragraph.field_ranges {
+            let Some(Control::Field(field)) = paragraph.controls.get(range.control_idx) else {
+                continue;
+            };
+            if field.field_type != FieldType::ClickHere {
+                continue;
+            }
+            let start = text_to_logical_offset(paragraph, range.start_char_idx);
+            let end = text_to_logical_offset(paragraph, range.end_char_idx);
+            let mut at = position.clone();
+            at.scalar_offset = start as u32;
+            fields.push(json!({
+                "position": at,
+                "length": end.saturating_sub(start),
+                "name": field.ctrl_data_name.clone().unwrap_or_default(),
+                "editable": field.is_editable_in_form(),
+            }));
+        }
+    };
+    for (s, section) in core.document().sections.iter().enumerate() {
+        for (p, paragraph) in section.paragraphs.iter().enumerate() {
+            let body = NativeTextPosition {
+                section: s as u32,
+                paragraph: p as u32,
+                scalar_offset: 0,
+                cell_path: Vec::new(),
+            };
+            add(paragraph, body.clone());
+            for (c, control) in paragraph.controls.iter().enumerate() {
+                let Control::Table(table) = control else {
+                    continue;
+                };
+                for (cell_index, cell) in table.cells.iter().enumerate() {
+                    for (cp, cell_paragraph) in cell.paragraphs.iter().enumerate() {
+                        let mut position = body.clone();
+                        position.cell_path = vec![NativeCellPathEntry {
+                            control: c as u32,
+                            cell: cell_index as u32,
+                            paragraph: cp as u32,
+                        }];
+                        add(cell_paragraph, position);
+                    }
+                }
+            }
+        }
+    }
+    fields
+}
+
+fn true_value() -> bool {
+    true
 }
 
 /// A collapsed caret at the start of a body paragraph.
@@ -3064,6 +3248,106 @@ mod tests {
         request["action"] = json!("deleteObject");
         editor.apply_action(revision, action(request)).unwrap();
         assert_eq!(shown(&editor), "수=식");
+    }
+
+    #[test]
+    fn click_here_fields_insert_fill_and_edit() {
+        let mut editor = editor("이름: ", selected(4, 4));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertField", "guide": "이름을 쓰세요", "name": "name"})),
+            )
+            .unwrap();
+        let field = editor.query(NativeQuery::ClickHereAtCaret {}).unwrap();
+        assert_eq!(field["found"], json!(true));
+        assert_eq!(field["guide"], json!("이름을 쓰세요"));
+        assert_eq!(field["name"], json!("name"));
+        // Typing at the caret fills the field: the text stays inside it.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "홍길동").unwrap();
+        assert_eq!(text(&editor), "이름: 홍길동");
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(5, 5)).unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::ClickHereAtCaret {}).unwrap()["fieldId"],
+            field["fieldId"]
+        );
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "setFieldProperties", "guide": "성명", "memo": "필수",
+                              "name": "person", "editable": false}),
+                ),
+            )
+            .unwrap();
+        let field = editor.query(NativeQuery::ClickHereAtCaret {}).unwrap();
+        assert_eq!(field["guide"], json!("성명"));
+        assert_eq!(field["memo"], json!("필수"));
+        assert_eq!(field["name"], json!("person"));
+        assert_eq!(field["editable"], json!(false));
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(1, 1)).unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::ClickHereAtCaret {}).unwrap()["found"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn form_mode_allows_only_editable_click_here_text() {
+        let mut editor = editor("이름: ", selected(4, 4));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertField", "guide": "이름"})),
+            )
+            .unwrap();
+        let fields = editor.query(NativeQuery::FormFields {}).unwrap()["fields"].clone();
+        assert_eq!(fields.as_array().unwrap().len(), 1);
+        assert_eq!(fields[0]["position"]["scalarOffset"], json!(4));
+        let mut marks = editor.session().editor_marks();
+        marks.form_mode = true;
+        editor.set_editor_marks(marks);
+        // Inside the field: typing works.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "홍길동").unwrap();
+        assert_eq!(text(&editor), "이름: 홍길동");
+        // Outside it, splitting paragraphs and actions are refused.
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(0, 0)).unwrap();
+        let revision = current_revision(&editor);
+        assert!(matches!(
+            editor.replace_selection(revision, "x"),
+            Err(NativeHostError::Unsupported(_))
+        ));
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(5, 5)).unwrap();
+        let revision = current_revision(&editor);
+        assert!(editor
+            .execute_command(
+                revision,
+                serde_json::from_value(json!({"command": "splitParagraph"})).unwrap()
+            )
+            .is_err());
+        let revision = current_revision(&editor);
+        assert!(editor
+            .apply_action(
+                revision,
+                action(json!({"action": "charFormat", "props": {"bold": true}}))
+            )
+            .is_err());
+        assert_eq!(text(&editor), "이름: 홍길동");
+        marks.form_mode = false;
+        editor.set_editor_marks(marks);
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(0, 0)).unwrap();
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "x").unwrap();
     }
 
     #[test]

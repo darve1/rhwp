@@ -449,6 +449,7 @@ impl DocumentCore {
             show_control_codes: false,
             show_transparent_borders: false,
             clip_enabled: true,
+            native_form_mode: false,
             debug_overlay: false,
             respect_vpos_reset: false,
             hangul2024_compat: false,

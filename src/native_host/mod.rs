@@ -146,6 +146,10 @@ pub struct NativeEditorMarks {
     /// Clip drawing to the page (the default); off shows what spills over.
     #[serde(default = "clip_default")]
     pub clip: bool,
+    /// 양식 모드: text edits only inside 누름틀 editable in forms; no other
+    /// edits or actions. A session setting, not saved in the document.
+    #[serde(default)]
+    pub form_mode: bool,
 }
 
 fn clip_default() -> bool {
@@ -159,6 +163,7 @@ impl NativeDocumentSession {
         self.core.show_control_codes = marks.control_codes;
         self.core.show_transparent_borders = marks.transparent_borders;
         self.core.clip_enabled = marks.clip;
+        self.core.native_form_mode = marks.form_mode;
         self.core.invalidate_page_tree_cache();
     }
 
@@ -168,6 +173,7 @@ impl NativeDocumentSession {
             control_codes: self.core.show_control_codes,
             transparent_borders: self.core.show_transparent_borders,
             clip: self.core.clip_enabled,
+            form_mode: self.core.native_form_mode,
         }
     }
 
