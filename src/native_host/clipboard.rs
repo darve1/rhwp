@@ -59,7 +59,8 @@ impl NativeEditor {
         let plain_text = self.selected_text(selection);
         check_text_controls(&plain_text)?;
         let (start, end) = Self::ordered(selection);
-        let html = if empty_fragment {
+        // HTML export indexes characters; keep plain text where inline objects shift offsets.
+        let html = if empty_fragment || Self::holds_inline(self.session().document(), start, end) {
             None
         } else {
             let core = self.session().document();
@@ -422,7 +423,9 @@ fn clipboard_selection_size(
         ));
     }
     for index in first..=last {
-        let text = &paragraphs[index as usize].text;
+        let text = crate::document_core::native_interaction::native_paragraph_text(
+            &paragraphs[index as usize],
+        );
         let from = if index == first {
             start.scalar_offset as usize
         } else {

@@ -2,15 +2,21 @@
 //!
 //! This surface edits body text and table-cell text. A selection stays inside
 //! one container: the body paragraphs of a section, or the paragraphs of one
-//! (possibly nested) table cell. Offsets are Unicode scalar indices;
-//! object-bearing paragraph mutations, inline-control affinity and
-//! tabs are rejected explicitly. Read-only selection may span floating objects.
+//! (possibly nested) table cell. Offsets are Unicode scalar indices on the
+//! core's logical caret axis: an inline (treat-as-char) object, footnote or
+//! endnote takes one offset and shows as U+FFFC in paragraph text. Text edits
+//! never remove objects, and tabs are rejected explicitly. Read-only selection
+//! may span objects.
 //! Paragraph split/join and grapheme navigation live in `commands`. OS IME events
 //! and screen coordinates belong to the host, not to this session.
 
 use std::collections::VecDeque;
 
-use crate::document_core::native_interaction::{NativeTextPosition, NativeTextSelection};
+use std::borrow::Cow;
+
+use crate::document_core::native_interaction::{
+    native_paragraph_text, native_to_text_offset, NativeTextPosition, NativeTextSelection,
+};
 use crate::model::control::Control;
 use crate::model::paragraph::Paragraph;
 use crate::DocumentCore;
@@ -606,8 +612,8 @@ impl NativeEditor {
     /// tables...), but no control may be anchored strictly inside it, where
     /// removing the text would also remove the control. A control at text
     /// position `p` sits before character `p`, so one at either end of the
-    /// range stays. Inserting at a caret never removes a control. Inline
-    /// (treat-as-char) objects are already rejected by selection validation.
+    /// range stays. An inline object fills its own offset, so a range that
+    /// covers it is refused. Inserting at a caret never removes a control.
     /// Keep this separate from selection validation: read-only navigation and
     /// identical-text no-ops do not need to modify an object's paragraph.
     pub(super) fn check_body_text_span(
@@ -627,20 +633,23 @@ impl NativeEditor {
             let before = end.scalar_offset as usize;
             // Removed: [after, before) of a single paragraph; the tail of the
             // first and the head of the last paragraph of a longer range (they
-            // merge); every middle paragraph whole.
-            let removes = |position: usize| match (index == first, index == last) {
-                (true, true) => position > after && position < before,
-                (true, false) => position > after,
+            // merge); every middle paragraph whole. Offsets are logical: an
+            // inline object fills offset `q`, any other control sits before it.
+            let removes = |position: usize, inline: bool| match (index == first, index == last) {
+                (true, true) => {
+                    (position > after || inline && position == after) && position < before
+                }
+                (true, false) => position > after || inline && position == after,
                 (false, true) => position < before,
                 (false, false) => true,
             };
             let anchored = paragraph
-                .control_text_positions()
+                .logical_control_positions()
                 .into_iter()
                 .zip(&paragraph.controls)
                 .any(|(position, control)| {
                     !matches!(control, Control::SectionDef(_) | Control::ColumnDef(_))
-                        && removes(position)
+                        && removes(position, control.is_logical_inline())
                 });
             if anchored {
                 return Err(NativeHostError::Unsupported(
@@ -702,7 +711,7 @@ impl NativeEditor {
         let (first, last) = (Self::leaf(start), Self::leaf(end));
         (first..=last)
             .map(|paragraph| {
-                let text = &paragraphs[paragraph as usize].text;
+                let text = native_paragraph_text(&paragraphs[paragraph as usize]);
                 let from = if paragraph == first {
                     start.scalar_offset as usize
                 } else {
@@ -741,6 +750,10 @@ impl NativeEditor {
         if start.paragraph == end.paragraph
             && end.scalar_offset - start.scalar_offset <= 8
             && text.chars().count() <= 8
+            && !Self::paragraph_at(core, start)?
+                .controls
+                .iter()
+                .any(Control::is_logical_inline)
         {
             core.replace_body_text_local_native(
                 start.section as usize,
@@ -755,22 +768,10 @@ impl NativeEditor {
             return Ok(());
         }
         if start != end {
-            core.delete_range_native(
-                start.section as usize,
-                start.paragraph as usize,
-                start.scalar_offset as usize,
-                end.paragraph as usize,
-                end.scalar_offset as usize,
-                None,
-            )?;
+            Self::delete_in_container(core, start, end)?;
         }
         if !text.is_empty() {
-            core.insert_text_native(
-                start.section as usize,
-                start.paragraph as usize,
-                start.scalar_offset as usize,
-                text,
-            )?;
+            Self::insert_in_container(core, start, text)?;
         }
         Ok(())
     }
@@ -895,17 +896,55 @@ impl NativeEditor {
         Ok(paragraphs)
     }
 
-    /// Text of the position's paragraph.
-    pub(super) fn paragraph_text<'a>(
+    /// The position's paragraph.
+    pub(super) fn paragraph_at<'a>(
         core: &'a DocumentCore,
         position: &NativeTextPosition,
-    ) -> Result<&'a str, NativeHostError> {
+    ) -> Result<&'a Paragraph, NativeHostError> {
         Self::container(core, position)?
             .get(Self::leaf(position) as usize)
-            .map(|paragraph| paragraph.text.as_str())
             .ok_or_else(|| {
                 NativeHostError::InvalidArgument("text position is outside the document".into())
             })
+    }
+
+    /// Text of the position's paragraph on the native axis (inline objects
+    /// as U+FFFC).
+    pub(super) fn paragraph_text<'a>(
+        core: &'a DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<Cow<'a, str>, NativeHostError> {
+        Ok(native_paragraph_text(Self::paragraph_at(core, position)?))
+    }
+
+    /// The position as an index into its paragraph's text, the axis of the
+    /// core's character-indexed methods (formatting, properties, inserting
+    /// controls). The same offset in a paragraph without inline objects.
+    pub(super) fn text_offset(
+        core: &DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<usize, NativeHostError> {
+        Ok(native_to_text_offset(
+            Self::paragraph_at(core, position)?,
+            position.scalar_offset as usize,
+        )
+        .0)
+    }
+
+    pub(super) fn holds_inline(
+        core: &DocumentCore,
+        start: &NativeTextPosition,
+        end: &NativeTextPosition,
+    ) -> bool {
+        Self::container(core, start).is_ok_and(|paragraphs| {
+            paragraphs
+                .get(Self::leaf(start) as usize..=Self::leaf(end) as usize)
+                .is_some_and(|range| {
+                    range
+                        .iter()
+                        .any(|paragraph| paragraph.controls.iter().any(Control::is_logical_inline))
+                })
+        })
     }
 
     /// The core's `_by_path` address: (control, cell, cell paragraph) per level.
@@ -923,24 +962,32 @@ impl NativeEditor {
             .collect()
     }
 
+    /// Inserts at a logical caret: next to an inline object, the text goes
+    /// on the caret's side of it.
     pub(super) fn insert_in_container(
         core: &mut DocumentCore,
         position: &NativeTextPosition,
         text: &str,
     ) -> Result<(), NativeHostError> {
+        let (offset, after_object) = native_to_text_offset(
+            Self::paragraph_at(core, position)?,
+            position.scalar_offset as usize,
+        );
         if position.cell_path.is_empty() {
-            core.insert_text_native(
+            core.insert_text_at_caret_native(
                 position.section as usize,
                 position.paragraph as usize,
-                position.scalar_offset as usize,
+                offset,
+                after_object,
                 text,
             )?;
         } else {
-            core.insert_text_in_cell_by_path(
+            core.insert_text_in_cell_at_caret_by_path(
                 position.section as usize,
                 position.paragraph as usize,
                 &Self::core_path(position),
-                position.scalar_offset as usize,
+                offset,
+                after_object,
                 text,
             )?;
         }
@@ -952,7 +999,16 @@ impl NativeEditor {
         start: &NativeTextPosition,
         end: &NativeTextPosition,
     ) -> Result<(), NativeHostError> {
-        if start.cell_path.is_empty() {
+        let inline = Self::holds_inline(core, start, end);
+        if start.cell_path.is_empty() && inline {
+            core.delete_range_logical_native(
+                start.section as usize,
+                start.paragraph as usize,
+                start.scalar_offset as usize,
+                end.paragraph as usize,
+                end.scalar_offset as usize,
+            )?;
+        } else if start.cell_path.is_empty() {
             core.delete_range_native(
                 start.section as usize,
                 start.paragraph as usize,
@@ -962,14 +1018,20 @@ impl NativeEditor {
                 None,
             )?;
         } else {
+            // Cells take text indices; the range holds no inline object (see
+            // `check_body_text_span`), so its ends map to the same characters.
+            let (from, to) = (
+                Self::text_offset(core, start)?,
+                Self::text_offset(core, end)?,
+            );
             core.delete_range_in_cell_by_path(
                 start.section as usize,
                 start.paragraph as usize,
                 &Self::core_path(start),
                 Self::leaf(start) as usize,
-                start.scalar_offset as usize,
+                from,
                 Self::leaf(end) as usize,
-                end.scalar_offset as usize,
+                to,
             )?;
         }
         Ok(())
@@ -1592,5 +1654,173 @@ mod marks_tests {
             before
         );
         assert!(!editor.can_undo());
+    }
+}
+
+#[cfg(test)]
+mod inline_object_tests {
+    use super::actions::NativeQuery;
+    use super::*;
+    use crate::document_core::native_interaction::native_paragraph_text;
+    use serde_json::json;
+
+    const PNG: [u8; 67] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn at(offset: u32) -> NativeTextPosition {
+        NativeTextPosition {
+            section: 0,
+            paragraph: 0,
+            scalar_offset: offset,
+            cell_path: Vec::new(),
+        }
+    }
+
+    fn range(anchor: u32, focus: u32) -> NativeTextSelection {
+        NativeTextSelection {
+            anchor: at(anchor),
+            focus: at(focus),
+        }
+    }
+
+    /// "가나다라" with a treat-as-char picture between 나 and 다: native
+    /// offsets 가0 나1 [그림]2 다3 라4.
+    fn editor_with_inline_picture() -> NativeEditor {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.insert_text_native(0, 0, 0, "가나다라").unwrap();
+        core.insert_picture_native(0, 0, 2, &[], &PNG, 7500, 7500, 1, 1, "png", "", None, None)
+            .unwrap();
+        let mut document = core.document().clone();
+        for control in &mut document.sections[0].paragraphs[0].controls {
+            if let Control::Picture(picture) = control {
+                picture.common.treat_as_char = true;
+            }
+        }
+        core.set_document(document);
+        NativeEditor::new(NativeDocumentSession::from_core(core), range(0, 0)).unwrap()
+    }
+
+    fn paragraph(editor: &NativeEditor) -> &Paragraph {
+        &editor.session().document().document().sections[0].paragraphs[0]
+    }
+
+    fn shown(editor: &NativeEditor) -> String {
+        native_paragraph_text(paragraph(editor)).into_owned()
+    }
+
+    fn has_picture(editor: &NativeEditor) -> bool {
+        paragraph(editor)
+            .controls
+            .iter()
+            .any(|control| matches!(control, Control::Picture(_)))
+    }
+
+    fn replace(
+        editor: &mut NativeEditor,
+        selection: NativeTextSelection,
+        text: &str,
+    ) -> Result<NativeEditOutcome, NativeHostError> {
+        let revision = editor.session().revision();
+        editor.set_selection(revision, selection)?;
+        let revision = editor.session().revision();
+        editor.replace_selection(revision, text)
+    }
+
+    #[test]
+    fn an_inline_object_takes_one_offset_and_shows_as_object_replacement() {
+        let editor = editor_with_inline_picture();
+        assert_eq!(shown(&editor), "가나\u{FFFC}다라");
+        let core = editor.session().document();
+        let carets: Vec<f64> = (0..=5)
+            .map(|offset| core.native_caret_rect(&at(offset)).unwrap().x)
+            .collect();
+        assert!(
+            carets.windows(2).all(|pair| pair[0] < pair[1]),
+            "{carets:?}"
+        );
+        assert!(core.native_caret_rect(&at(6)).is_err());
+    }
+
+    #[test]
+    fn typing_goes_on_the_caret_side_of_the_inline_object() {
+        let mut editor = editor_with_inline_picture();
+        replace(&mut editor, range(2, 2), "앞").unwrap();
+        assert_eq!(shown(&editor), "가나앞\u{FFFC}다라");
+        replace(&mut editor, range(4, 4), "뒤").unwrap();
+        assert_eq!(shown(&editor), "가나앞\u{FFFC}뒤다라");
+        assert_eq!(paragraph(&editor).text, "가나앞뒤다라");
+        assert_eq!(editor.selection().focus.scalar_offset, 5);
+        // A long insertion takes the general path, not the local fast path.
+        replace(&mut editor, range(5, 5), "0123456789").unwrap();
+        assert_eq!(shown(&editor), "가나앞\u{FFFC}뒤0123456789다라");
+        assert!(has_picture(&editor));
+    }
+
+    #[test]
+    fn deleting_text_keeps_the_object_and_deleting_the_object_is_refused() {
+        let mut editor = editor_with_inline_picture();
+        // Delete 나 (before) and 다 (after) the picture.
+        replace(&mut editor, range(1, 2), "").unwrap();
+        assert_eq!(shown(&editor), "가\u{FFFC}다라");
+        replace(&mut editor, range(2, 3), "").unwrap();
+        assert_eq!(shown(&editor), "가\u{FFFC}라");
+        let revision = editor.session().revision();
+        for selection in [range(1, 2), range(0, 3), range(2, 1)] {
+            assert!(matches!(
+                replace(&mut editor, selection, "x"),
+                Err(NativeHostError::Unsupported(_))
+            ));
+        }
+        assert_eq!(editor.session().revision(), revision);
+        assert_eq!(shown(&editor), "가\u{FFFC}라");
+        assert!(has_picture(&editor));
+    }
+
+    #[test]
+    fn formatting_and_properties_index_the_characters_around_the_object() {
+        let mut editor = editor_with_inline_picture();
+        let revision = editor.session().revision();
+        editor.set_selection(revision, range(3, 5)).unwrap();
+        let revision = editor.session().revision();
+        editor
+            .apply_action(
+                revision,
+                serde_json::from_value(json!({"action": "charFormat", "props": {"bold": true}}))
+                    .unwrap(),
+            )
+            .unwrap();
+        let bold = |editor: &mut NativeEditor, offset: u32| {
+            let revision = editor.session().revision();
+            editor
+                .set_selection(revision, range(offset, offset + 1))
+                .unwrap();
+            editor.query(NativeQuery::CharProperties {}).unwrap()["bold"].clone()
+        };
+        assert_eq!(bold(&mut editor, 3), json!(true));
+        assert_eq!(bold(&mut editor, 4), json!(true));
+        assert_eq!(bold(&mut editor, 1), json!(false));
+    }
+
+    #[test]
+    fn splitting_after_the_object_keeps_it_in_the_first_paragraph() {
+        let mut editor = editor_with_inline_picture();
+        let revision = editor.session().revision();
+        editor.set_selection(revision, range(3, 3)).unwrap();
+        let revision = editor.session().revision();
+        editor
+            .execute_command(
+                revision,
+                serde_json::from_value(json!({"command": "splitParagraph"})).unwrap(),
+            )
+            .unwrap();
+        let paragraphs = &editor.session().document().document().sections[0].paragraphs;
+        assert_eq!(native_paragraph_text(&paragraphs[0]), "가나\u{FFFC}");
+        assert_eq!(native_paragraph_text(&paragraphs[1]), "다라");
     }
 }

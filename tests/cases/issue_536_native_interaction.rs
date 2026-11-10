@@ -215,8 +215,10 @@ fn malformed_cell_paths_are_not_flattened_or_defaulted() {
     }
 }
 
+/// hwpmac/native-actions: an inline object takes one logical offset, so the
+/// carets before and after it are distinct positions (was: rejected).
 #[test]
-fn inline_object_affinity_is_explicitly_unsupported() {
+fn inline_objects_take_one_logical_offset() {
     let mut core = blank();
     core.create_table_native(0, 0, 0, 1, 1).unwrap();
     let mut document = core.document().clone();
@@ -236,15 +238,20 @@ fn inline_object_affinity_is_explicitly_unsupported() {
         .unwrap();
     table.common.treat_as_char = true;
     core.set_document(document);
-    let position = body(paragraph, 0);
-    core.validate_native_text_position(&position).unwrap();
+    let before = body(paragraph, 0);
+    let after = body(paragraph, 1);
+    for position in [&before, &after] {
+        core.validate_native_text_position(position).unwrap();
+        core.check_native_interaction_support(position).unwrap();
+    }
+    let (left, right) = (
+        core.native_caret_rect(&before).unwrap(),
+        core.native_caret_rect(&after).unwrap(),
+    );
+    assert!(left.x < right.x, "{left:?} {right:?}");
     assert!(matches!(
-        core.check_native_interaction_support(&position),
-        Err(NativeInteractionError::Unsupported(_))
-    ));
-    assert!(matches!(
-        core.native_caret_rect(&position),
-        Err(NativeInteractionError::Unsupported(_))
+        core.validate_native_text_position(&body(paragraph, 2)),
+        Err(NativeInteractionError::InvalidPosition(_))
     ));
 }
 

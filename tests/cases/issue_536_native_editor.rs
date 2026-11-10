@@ -574,6 +574,8 @@ fn issue_536_native_editor_failed_begin_keeps_viewer_and_allows_retry() {
     assert_eq!(text(&editor), "가😀나");
 }
 
+/// hwpmac/native-actions: the editor opens at an inline object, and typing
+/// before it keeps the object (was: rejected, with the viewer kept open).
 #[test]
 fn issue_536_native_editor_inline_first_paragraph_keeps_viewer_open() {
     use rhwp::model::control::Control;
@@ -599,23 +601,24 @@ fn issue_536_native_editor_inline_first_paragraph_keeps_viewer_open() {
         })
         .unwrap();
     core.set_document(document);
-    let before = serde_json::to_value(&core.document().sections[0].paragraphs).unwrap();
     let session = NativeDocumentSession::from_core(core);
     let at_object = NativeTextSelection {
         anchor: position(paragraph, 0),
         focus: position(paragraph, 0),
     };
-    let (session, error) = match NativeEditor::try_new(session, at_object) {
-        Err(failed) => *failed,
-        Ok(_) => panic!("inline-object affinity is outside body-text editing"),
+    let mut editor = match NativeEditor::try_new(session, at_object) {
+        Ok(editor) => editor,
+        Err(_) => panic!("the editor opens at an inline object"),
     };
-    assert!(matches!(error, NativeHostError::Unsupported(_)));
-    assert_eq!(session.revision(), 0);
-    assert_eq!(
-        serde_json::to_value(&session.document().document().sections[0].paragraphs).unwrap(),
-        before
-    );
-    assert!(!session.document().get_document_info().is_empty());
+    editor.replace_selection(0, "앞").unwrap();
+    let edited = &editor.session().document().document().sections[0].paragraphs[paragraph as usize];
+    assert_eq!(edited.text, "앞");
+    assert!(edited
+        .controls
+        .iter()
+        .any(|control| matches!(control, Control::Table(_))));
+    assert_eq!(editor.selection().focus.scalar_offset, 1);
+    assert!(!editor.session().document().get_document_info().is_empty());
 }
 
 #[cfg(feature = "native-skia")]

@@ -2208,6 +2208,63 @@ impl DocumentCore {
         paginate_immediately: bool,
         field_control: Option<usize>,
     ) -> Result<String, HwpError> {
+        self.replace_text_in_cell_at_caret_impl(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            char_offset,
+            delete_count,
+            text,
+            paginate_immediately,
+            field_control,
+            false,
+        )
+    }
+
+    /// 표 셀 글 넣기. `after_inline_control` 이면 `char_offset` 자리에 놓인 개체 뒤에 넣는다
+    /// (본문의 [`Self::insert_text_at_caret_native`] 와 같은 규칙).
+    pub(crate) fn insert_text_in_cell_at_caret_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        char_offset: usize,
+        after_inline_control: bool,
+        text: &str,
+    ) -> Result<String, HwpError> {
+        self.replace_text_in_cell_at_caret_impl(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            char_offset,
+            0,
+            text,
+            true,
+            None,
+            after_inline_control,
+        )
+    }
+
+    fn replace_text_in_cell_at_caret_impl(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        char_offset: usize,
+        delete_count: usize,
+        text: &str,
+        paginate_immediately: bool,
+        field_control: Option<usize>,
+        after_inline_control: bool,
+    ) -> Result<String, HwpError> {
         let normalized = normalize_text_newlines(text);
         let text = normalized.as_ref();
         let new_chars_count = text.chars().count();
@@ -2270,11 +2327,16 @@ impl DocumentCore {
                 delete_count,
                 text,
                 Some(control),
-                false,
+                after_inline_control,
             ),
-            None => {
-                replace_paragraph_text(cell_para, char_offset, delete_count, text, active, false)
-            }
+            None => replace_paragraph_text(
+                cell_para,
+                char_offset,
+                delete_count,
+                text,
+                active,
+                after_inline_control,
+            ),
         };
         debug_assert_eq!(deleted_count, delete_count);
 
@@ -6456,19 +6518,40 @@ impl DocumentCore {
         char_offset: usize,
         text: &str,
     ) -> Result<String, HwpError> {
+        self.insert_text_in_cell_at_caret_by_path(
+            section_idx,
+            parent_para_idx,
+            path,
+            char_offset,
+            false,
+            text,
+        )
+    }
+
+    /// path 기반 셀 텍스트 삽입. `after_inline_control` 이면 그 자리의 개체 뒤에 넣는다.
+    pub(crate) fn insert_text_in_cell_at_caret_by_path(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        char_offset: usize,
+        after_inline_control: bool,
+        text: &str,
+    ) -> Result<String, HwpError> {
         let normalized = normalize_text_newlines(text);
         let text = normalized.as_ref();
         // 깊이 1 표는 일반 셀 삽입 경로가 셀 폭 리플로우와 vpos 재계산을 이미 담당한다.
         // IME가 cellPath를 항상 전달하더라도 같은 편집 계약을 사용해야 한다.
         if path.len() == 1 {
             let (control_idx, cell_idx, cell_para_idx) = path[0];
-            return self.insert_text_in_cell_native(
+            return self.insert_text_in_cell_at_caret_native(
                 section_idx,
                 parent_para_idx,
                 control_idx,
                 cell_idx,
                 cell_para_idx,
                 char_offset,
+                after_inline_control,
                 text,
             );
         }
@@ -6481,7 +6564,14 @@ impl DocumentCore {
             Some(path),
         );
         let cell_para = self.get_cell_paragraph_mut_by_path(section_idx, parent_para_idx, path)?;
-        replace_paragraph_text(cell_para, char_offset, 0, text, active, false);
+        replace_paragraph_text(
+            cell_para,
+            char_offset,
+            0,
+            text,
+            active,
+            after_inline_control,
+        );
 
         let inner_cell_para_idx = path.last().map(|entry| entry.2).unwrap_or(0);
         self.reflow_cell_paragraph_by_path(section_idx, parent_para_idx, path, inner_cell_para_idx);

@@ -288,15 +288,17 @@ impl SnapshotWalk<'_> {
             self.stopped = true;
             return Ok(());
         }
-        let mut byte_end = paragraph.text.len().min(self.remaining_text);
-        while !paragraph.text.is_char_boundary(byte_end) {
+        // Native offsets count inline objects; their U+FFFC keeps text and offsets aligned.
+        let full = crate::document_core::native_interaction::native_paragraph_text(paragraph);
+        let mut byte_end = full.len().min(self.remaining_text);
+        while !full.is_char_boundary(byte_end) {
             byte_end -= 1;
         }
-        let text = paragraph.text[..byte_end].to_owned();
+        let text = full[..byte_end].to_owned();
         self.remaining_text -= text.len();
         let mut end = start.clone();
         end.scalar_offset = text.chars().count() as u32; // <=1 MiB
-        let text_complete = byte_end == paragraph.text.len();
+        let text_complete = byte_end == full.len();
         let geometry = self
             .request
             .geometry

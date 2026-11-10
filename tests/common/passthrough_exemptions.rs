@@ -5,6 +5,12 @@
 /// 파일 경로는 [`SCAN_ROOT`] 기준 상대 경로다. 병합 `devel` 기준 46건(2026-08-30 동결).
 const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
     (
+        "commands/text_editing.rs",
+        "insert_text_in_cell_by_path",
+        Exempt::DelegatesTo("insert_text_in_cell_at_caret_by_path"),
+        "hwpmac/native-actions: 개체 앞(after_inline_control=false) 넣기로 위임한다. 위임 대상이 구역의 raw_stream을 비운다.",
+    ),
+    (
         "commands/compose_controls.rs",
         "insert_ruby_at",
         Exempt::DelegatesTo("insert_compose_control"),

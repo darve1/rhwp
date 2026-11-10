@@ -1,17 +1,79 @@
 //! Typed interaction queries over the existing layout and cursor implementation.
 //!
-//! Positions use Unicode scalar offsets, never UTF-16 code units or logical
-//! inline-object slots. Body text and nested table cells are supported. A target
-//! paragraph containing logical inline controls or character overlaps is rejected:
-//! the legacy cursor contract mixes text and object slots, and this facade has no
-//! object-side affinity. Text boxes, captions, notes and header/footer editing are
-//! also outside this initial contract. Queries do not change the document/caret.
+//! Positions use Unicode scalar offsets on the core's logical caret axis, never
+//! UTF-16 code units: each text character and each logical inline control
+//! (treat-as-char object, footnote, endnote, character overlap) counts one, so
+//! a caret before and after an inline object are different offsets. In a
+//! paragraph without inline controls this is the plain scalar offset. Native
+//! hosts see each inline control as [`NATIVE_OBJECT_CHAR`] in paragraph text.
+//! Body text and nested table cells are supported. Text boxes, captions, notes
+//! and header/footer editing are outside this contract. Queries do not change
+//! the document/caret.
 
 use super::DocumentCore;
 use crate::error::HwpError;
 use crate::model::{control::Control, paragraph::Paragraph};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// How native paragraph text shows a logical inline control.
+pub const NATIVE_OBJECT_CHAR: char = '\u{FFFC}';
+
+/// Number of native offsets in `paragraph`: characters plus inline controls.
+pub fn native_paragraph_length(paragraph: &Paragraph) -> usize {
+    crate::document_core::helpers::logical_paragraph_length(paragraph)
+}
+
+/// The native offsets of the paragraph's inline controls, in order.
+pub fn native_inline_slots(paragraph: &Paragraph) -> Vec<usize> {
+    paragraph
+        .logical_control_positions()
+        .into_iter()
+        .zip(&paragraph.controls)
+        .filter(|(_, control)| control.is_logical_inline())
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+/// Paragraph text on the native axis: [`NATIVE_OBJECT_CHAR`] at each inline
+/// control's slot. Borrowed when the paragraph has none.
+pub fn native_paragraph_text(paragraph: &Paragraph) -> std::borrow::Cow<'_, str> {
+    let slots = native_inline_slots(paragraph);
+    if slots.is_empty() {
+        return std::borrow::Cow::Borrowed(&paragraph.text);
+    }
+    let mut characters = paragraph.text.chars();
+    let mut text = String::with_capacity(paragraph.text.len() + slots.len() * 3);
+    let mut slots = slots.into_iter().peekable();
+    for offset in 0..native_paragraph_length(paragraph) {
+        if slots.next_if_eq(&offset).is_some() {
+            text.push(NATIVE_OBJECT_CHAR);
+        } else if let Some(character) = characters.next() {
+            text.push(character);
+        }
+    }
+    text.extend(characters);
+    std::borrow::Cow::Owned(text)
+}
+
+/// The text-axis offset (an index into `paragraph.text`) for a native offset,
+/// and whether the native caret sits after an inline control at that index.
+pub fn native_to_text_offset(paragraph: &Paragraph, offset: usize) -> (usize, bool) {
+    crate::document_core::helpers::logical_to_text_offset(paragraph, offset)
+}
+
+/// The native offset of the character at text index `index`: a control at
+/// text position `p` sits before character `p`.
+pub fn native_char_offset(paragraph: &Paragraph, index: usize) -> usize {
+    let positions = paragraph.control_text_positions();
+    index
+        + paragraph
+            .controls
+            .iter()
+            .zip(positions)
+            .filter(|(control, position)| control.is_logical_inline() && *position <= index)
+            .count()
+}
 
 /// Maximum nested table address depth accepted by the native facade.
 pub const NATIVE_CELL_PATH_MAX_DEPTH: usize = 32;
@@ -135,18 +197,14 @@ impl DocumentCore {
         self.native_text_paragraph(position).map(|_| ())
     }
 
-    /// Check the scalar-only interaction subset, also usable by native editors.
+    /// Check that a position is inside the interaction surface, also usable
+    /// by native editors. Paragraphs with inline controls are supported: their
+    /// offsets are logical (see the module documentation).
     pub fn check_native_interaction_support(
         &self,
         position: &NativeTextPosition,
     ) -> Result<(), NativeInteractionError> {
-        let paragraph = self.native_text_paragraph(position)?;
-        if paragraph.controls.iter().any(Control::is_logical_inline) {
-            return Err(NativeInteractionError::Unsupported(
-                "inline-object affinity is not supported by scalar interaction positions",
-            ));
-        }
-        Ok(())
+        self.native_text_paragraph(position).map(|_| ())
     }
 
     pub fn native_caret_rect(
@@ -356,7 +414,7 @@ impl DocumentCore {
                 .and_then(|cell| cell.paragraphs.get(entry.paragraph as usize))
                 .ok_or_else(invalid)?;
         }
-        if position.scalar_offset as usize > paragraph.text.chars().count() {
+        if position.scalar_offset as usize > native_paragraph_length(paragraph) {
             return Err(invalid());
         }
         Ok(paragraph)

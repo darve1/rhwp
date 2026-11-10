@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::document_core::native_interaction::{
-    NativeCellPathEntry, NativeTextPosition, NativeTextSelection,
+    native_char_offset, NativeCellPathEntry, NativeTextPosition, NativeTextSelection,
 };
 use crate::model::control::Control;
 use crate::model::table::Table;
@@ -199,6 +199,25 @@ pub enum NativeAction {
         paragraph: u32,
         control: u32,
     },
+    /// 각주 or 미주 (`kind` footnote or endnote) at a collapsed body-text
+    /// caret, holding `text`; each line becomes a note paragraph.
+    InsertNote {
+        kind: String,
+        text: String,
+    },
+    /// The text of the footnote or endnote whose marker is at the caret.
+    SetNoteText {
+        text: String,
+    },
+    /// Deletes the footnote or endnote whose marker is at the caret.
+    DeleteNote {},
+    /// 각주 모양 / 미주 모양 (`note` footnote or endnote) of the caret's
+    /// section: `numberFormat`, `prefixChar`, `suffixChar`, `startNumber`,
+    /// `numbering`, `placement`, ….
+    SetNoteShape {
+        note: String,
+        props: Value,
+    },
     /// Stacking order of a picture or shape: front, back, forward, backward.
     ObjectOrder {
         section: u32,
@@ -281,6 +300,11 @@ pub enum NativeQuery {
     PageHide {},
     /// The field around a body-text caret, `{"inField":false}` if none.
     FieldInfo {},
+    /// 각주 모양 or 미주 모양 of the caret's section.
+    NoteShape { note: String },
+    /// `{"found":false}`, or the footnote or endnote whose marker is at a
+    /// body-text caret: `kind`, `number` and `text` (lines are paragraphs).
+    NoteAtCaret {},
     /// Properties of a picture, shape or table control, with `kind`
     /// `picture`, `shape` or `table`.
     ObjectProperties {
@@ -353,12 +377,17 @@ impl NativeEditor {
                         if from >= to {
                             continue;
                         }
+                        // Formatting indexes the paragraph's characters.
+                        let (from, to) = (
+                            Self::text_offset(core, &position)?,
+                            Self::text_offset(core, &Self::at_leaf(start, paragraph, to))?,
+                        );
                         if position.cell_path.is_empty() {
                             core.apply_char_format_native(
                                 start.section as usize,
                                 paragraph as usize,
-                                from as usize,
-                                to as usize,
+                                from,
+                                to,
                                 &props,
                             )?;
                         } else {
@@ -366,8 +395,8 @@ impl NativeEditor {
                                 start.section as usize,
                                 start.paragraph as usize,
                                 &Self::core_path(&position),
-                                from as usize,
-                                to as usize,
+                                from,
+                                to,
                                 &props,
                             )?;
                         }
@@ -463,8 +492,8 @@ impl NativeEditor {
                     }
                     core.insert_hyperlink_native(
                         &link_target(start),
-                        start.scalar_offset as usize,
-                        end.scalar_offset as usize,
+                        Self::text_offset(core, start)?,
+                        Self::text_offset(core, end)?,
                         &uri,
                     )?;
                     Ok(selection.clone())
@@ -505,7 +534,7 @@ impl NativeEditor {
                     let result = parse(&core.add_bookmark_native(
                         caret.section as usize,
                         caret.paragraph as usize,
-                        caret.scalar_offset as usize,
+                        Self::text_offset(core, caret)?,
                         &name,
                     )?)?;
                     if result["ok"] != json!(true) {
@@ -547,7 +576,7 @@ impl NativeEditor {
                     core.insert_picture_native(
                         caret.section as usize,
                         caret.paragraph as usize,
-                        caret.scalar_offset as usize,
+                        Self::text_offset(core, caret)?,
                         &[],
                         &bytes,
                         width,
@@ -580,7 +609,7 @@ impl NativeEditor {
                     core.create_shape_control_native(
                         caret.section as usize,
                         caret.paragraph as usize,
-                        caret.scalar_offset as usize,
+                        Self::text_offset(core, caret)?,
                         width,
                         height,
                         to_units(rect.x),
@@ -718,6 +747,105 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::InsertNote { kind, text } => {
+                if !matches!(kind.as_str(), "footnote" | "endnote") {
+                    return Err(NativeHostError::InvalidArgument(
+                        "note: footnote or endnote".into(),
+                    ));
+                }
+                let mut result = Value::Null;
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    if selection.anchor != selection.focus {
+                        return Err(NativeHostError::Unsupported(
+                            "a note is inserted at a collapsed caret".into(),
+                        ));
+                    }
+                    let caret = body_caret(&selection.focus, "notes are inserted in body text")?;
+                    let (s, p, offset) = (
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        Self::text_offset(core, caret)?,
+                    );
+                    let created = parse(&if kind == "footnote" {
+                        core.insert_footnote_native(s, p, offset)?
+                    } else {
+                        core.insert_endnote_native(s, p, offset)?
+                    })?;
+                    let control = created["controlIdx"].as_u64().unwrap_or(0) as usize;
+                    if !text.is_empty() {
+                        set_note_text(core, s, p, control, &text)?;
+                    }
+                    // The caret goes right after the new note's number.
+                    let mut after = caret.clone();
+                    if let Some(slot) = core.document().sections[s].paragraphs[p]
+                        .logical_control_positions()
+                        .get(control)
+                    {
+                        after.scalar_offset = *slot as u32 + 1;
+                    }
+                    result = json!({ "number": created["footnoteNumber"].as_u64().or(created["endnoteNumber"].as_u64()) });
+                    Ok(NativeTextSelection {
+                        anchor: after.clone(),
+                        focus: after,
+                    })
+                })?;
+                Ok((outcome, result))
+            }
+            NativeAction::SetNoteText { text } => {
+                let caret = self.selection.focus.clone();
+                let Some((control, _)) = note_at(&self.session.core, &caret) else {
+                    return Err(NativeHostError::InvalidArgument(
+                        "the caret is not at a footnote or endnote".into(),
+                    ));
+                };
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    set_note_text(
+                        core,
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        control,
+                        &text,
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::SetNoteShape { note, props } => {
+                let props = props.to_string();
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let section = selection.focus.section as usize;
+                    match note.as_str() {
+                        "footnote" => core.apply_footnote_shape_native(section, &props)?,
+                        "endnote" => core.apply_endnote_shape_native(section, &props)?,
+                        _ => {
+                            return Err(NativeHostError::InvalidArgument(
+                                "note: footnote or endnote".into(),
+                            ))
+                        }
+                    };
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::DeleteNote {} => {
+                let caret = self.selection.focus.clone();
+                let Some((control, _)) = note_at(&self.session.core, &caret) else {
+                    return Err(NativeHostError::InvalidArgument(
+                        "the caret is not at a footnote or endnote".into(),
+                    ));
+                };
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    core.delete_footnote_native(
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        control,
+                    )?;
+                    Ok(Self::validate_selection(core, selection)
+                        .map(|_| selection.clone())
+                        .unwrap_or_else(|_| paragraph_start(caret.section, caret.paragraph)))
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::ObjectOrder {
                 section,
                 paragraph,
@@ -800,7 +928,7 @@ impl NativeEditor {
                     entry.paragraph = 0;
                 }
                 first.scalar_offset = 0;
-                let text = Self::paragraph_text(&self.session.core, &first)?.to_owned();
+                let text = Self::paragraph_text(&self.session.core, &first)?.into_owned();
                 let Some(formatted) = format_cell_number(&text, &operation) else {
                     return Err(NativeHostError::InvalidArgument(
                         "the cell does not hold a number".into(),
@@ -851,7 +979,7 @@ impl NativeEditor {
                     core.insert_new_number_native(
                         caret.section as usize,
                         caret.paragraph as usize,
-                        caret.scalar_offset as usize,
+                        Self::text_offset(core, caret)?,
                         start.max(1),
                     )?;
                     Ok(selection.clone())
@@ -864,7 +992,7 @@ impl NativeEditor {
                     core.remove_field_at(
                         caret.section as usize,
                         caret.paragraph as usize,
-                        caret.scalar_offset as usize,
+                        Self::text_offset(core, caret)?,
                     )?;
                     // The field's text went with it; keep the caret if it still fits.
                     Ok(if Self::validate_selection(core, selection).is_ok() {
@@ -1022,7 +1150,7 @@ impl NativeEditor {
                     let created = parse(&core.create_table_native(
                         caret.section as usize,
                         caret.paragraph as usize,
-                        caret.scalar_offset as usize,
+                        Self::text_offset(core, caret)?,
                         rows,
                         cols,
                     )?)?;
@@ -1075,14 +1203,14 @@ impl NativeEditor {
                 parse(&core.get_char_properties_at_native(
                     start.section as usize,
                     start.paragraph as usize,
-                    start.scalar_offset as usize,
+                    Self::text_offset(core, &start)?,
                 )?)
             }
             NativeQuery::CharProperties {} => parse(&core.get_cell_char_properties_at_by_path(
                 start.section as usize,
                 start.paragraph as usize,
                 &Self::core_path(&start),
-                start.scalar_offset as usize,
+                Self::text_offset(core, &start)?,
             )?),
             NativeQuery::ParaProperties {} if start.cell_path.is_empty() => {
                 parse(&core.get_para_properties_at_native(
@@ -1128,8 +1256,38 @@ impl NativeEditor {
                 parse(&core.get_field_info_at(
                     start.section as usize,
                     start.paragraph as usize,
-                    start.scalar_offset as usize,
+                    Self::text_offset(core, &start)?,
                 ))
+            }
+            NativeQuery::NoteShape { note } => parse(&match note.as_str() {
+                "footnote" => core.get_footnote_shape_native(start.section as usize)?,
+                "endnote" => core.get_endnote_shape_native(start.section as usize)?,
+                _ => {
+                    return Err(NativeHostError::InvalidArgument(
+                        "note: footnote or endnote".into(),
+                    ))
+                }
+            }),
+            NativeQuery::NoteAtCaret {} => {
+                let caret = &self.selection.focus;
+                Ok(match note_at(core, caret) {
+                    None => json!({ "found": false }),
+                    Some((control, kind)) => {
+                        let (number, paragraphs) = note_paragraphs(
+                            core,
+                            caret.section as usize,
+                            caret.paragraph as usize,
+                            control,
+                        )
+                        .ok_or_else(|| NativeHostError::Unsupported("no note here".into()))?;
+                        json!({
+                            "found": true,
+                            "kind": kind,
+                            "number": number,
+                            "text": note_text(paragraphs),
+                        })
+                    }
+                })
             }
             NativeQuery::ObjectProperties {
                 section,
@@ -1204,7 +1362,7 @@ impl NativeEditor {
                 Ok(json!({ "styles": styles, "current": current }))
             }
             NativeQuery::Hyperlink {} => {
-                let offset = start.scalar_offset as usize;
+                let offset = Self::text_offset(core, &start)?;
                 let links = core.hyperlinks_native(&link_target(&start))?;
                 Ok(links
                     .into_iter()
@@ -1223,7 +1381,24 @@ impl NativeEditor {
                 // `search_text_native` only finds matches strictly after its
                 // start, which skips a match right at a collapsed caret, and it
                 // cannot address nested cells.
-                let mut hits = core.native_text_search_hits(&query, case_sensitive);
+                // Hits index paragraph characters; the editor counts inline objects too.
+                let mut hits: Vec<_> = core
+                    .native_text_search_hits(&query, case_sensitive)
+                    .into_iter()
+                    .map(|(mut position, length)| {
+                        let Ok(paragraph) = Self::paragraph_at(core, &position) else {
+                            return (position, length);
+                        };
+                        let index = position.scalar_offset as usize;
+                        let start = native_char_offset(paragraph, index);
+                        let end = match length {
+                            0 => start,
+                            _ => native_char_offset(paragraph, index + length - 1) + 1,
+                        };
+                        position.scalar_offset = start as u32;
+                        (position, end - start)
+                    })
+                    .collect();
                 hits.sort_by_key(|(position, _)| order_key(position));
                 let hit = if forward {
                     let from = order_key(&end);
@@ -1785,6 +1960,134 @@ fn resolve_font_name(core: &mut DocumentCore, props: &Value) -> String {
         }
     }
     props.to_string()
+}
+
+/// The footnote or endnote (control index, kind) whose marker is right
+/// before a body-text caret, else right after it.
+fn note_at(core: &DocumentCore, caret: &NativeTextPosition) -> Option<(usize, &'static str)> {
+    if !caret.cell_path.is_empty() {
+        return None;
+    }
+    let paragraph = core
+        .document()
+        .sections
+        .get(caret.section as usize)?
+        .paragraphs
+        .get(caret.paragraph as usize)?;
+    let notes: Vec<(usize, usize, &'static str)> = paragraph
+        .logical_control_positions()
+        .into_iter()
+        .zip(&paragraph.controls)
+        .enumerate()
+        .filter_map(|(index, (slot, control))| match control {
+            Control::Footnote(_) => Some((index, slot, "footnote")),
+            Control::Endnote(_) => Some((index, slot, "endnote")),
+            _ => None,
+        })
+        .collect();
+    let offset = caret.scalar_offset as usize;
+    notes
+        .iter()
+        .find(|(_, slot, _)| slot + 1 == offset)
+        .or_else(|| notes.iter().find(|(_, slot, _)| *slot == offset))
+        .map(|&(index, _, kind)| (index, kind))
+}
+
+/// A note's number and paragraphs.
+fn note_paragraphs(
+    core: &DocumentCore,
+    section: usize,
+    paragraph: usize,
+    control: usize,
+) -> Option<(u16, &[crate::model::paragraph::Paragraph])> {
+    match core
+        .document()
+        .sections
+        .get(section)?
+        .paragraphs
+        .get(paragraph)?
+        .controls
+        .get(control)?
+    {
+        Control::Footnote(note) => Some((note.number, &note.paragraphs)),
+        Control::Endnote(note) => Some((note.number, &note.paragraphs)),
+        _ => None,
+    }
+}
+
+/// The note's text as the user sees it: its paragraphs as lines, without
+/// the spaces around the note number at the start.
+fn note_text(paragraphs: &[crate::model::paragraph::Paragraph]) -> String {
+    paragraphs
+        .iter()
+        .enumerate()
+        .map(|(index, paragraph)| {
+            if index == 0 {
+                paragraph.text.trim_start().to_owned()
+            } else {
+                paragraph.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replaces a note's text, keeping its number and the spaces before the
+/// text in the first paragraph; each line of `text` becomes a paragraph.
+fn set_note_text(
+    core: &mut DocumentCore,
+    section: usize,
+    paragraph: usize,
+    control: usize,
+    text: &str,
+) -> Result<(), NativeHostError> {
+    let Some((_, paragraphs)) = note_paragraphs(core, section, paragraph, control) else {
+        return Err(NativeHostError::InvalidArgument(
+            "the control is not a footnote or endnote".into(),
+        ));
+    };
+    if paragraphs.iter().any(|note_paragraph| {
+        note_paragraph
+            .controls
+            .iter()
+            .any(|control| !matches!(control, Control::AutoNumber(_)))
+    }) {
+        return Err(NativeHostError::Unsupported(
+            "the note holds objects; its text is not edited as plain text".into(),
+        ));
+    }
+    for _ in 1..paragraphs.len() {
+        core.merge_paragraph_in_footnote_native(section, paragraph, control, 1)?;
+    }
+    let first = &note_paragraphs(core, section, paragraph, control)
+        .expect("the note is still there")
+        .1[0];
+    let prefix = first.text.chars().take_while(|c| c.is_whitespace()).count();
+    let length = first.text.chars().count();
+    if length > prefix {
+        core.delete_text_in_footnote_native(
+            section,
+            paragraph,
+            control,
+            0,
+            prefix,
+            length - prefix,
+        )?;
+    }
+    let mut lines = text.split('\n');
+    let first_line = lines.next().unwrap_or("");
+    if !first_line.is_empty() {
+        core.insert_text_in_footnote_native(section, paragraph, control, 0, prefix, first_line)?;
+    }
+    let mut offset = prefix + first_line.chars().count();
+    for (index, line) in lines.enumerate() {
+        core.split_paragraph_in_footnote_native(section, paragraph, control, index, offset, None)?;
+        if !line.is_empty() {
+            core.insert_text_in_footnote_native(section, paragraph, control, index + 1, 0, line)?;
+        }
+        offset = line.chars().count();
+    }
+    Ok(())
 }
 
 /// A collapsed caret at the start of a body paragraph.
@@ -2555,6 +2858,101 @@ mod tests {
         let revision = current_revision(&editor);
         editor.replace_selection(revision, "새").unwrap();
         assert_eq!(text(&editor), "묶새기");
+    }
+
+    #[test]
+    fn footnotes_and_endnotes_insert_edit_and_delete() {
+        use crate::document_core::native_interaction::native_paragraph_text;
+        let shown = |editor: &NativeEditor| {
+            native_paragraph_text(&editor.session().document().document().sections[0].paragraphs[0])
+                .into_owned()
+        };
+        let mut editor = editor("각주", selected(1, 1));
+        let note = |editor: &mut NativeEditor| editor.query(NativeQuery::NoteAtCaret {}).unwrap();
+        assert_eq!(note(&mut editor)["found"], json!(false));
+        let revision = current_revision(&editor);
+        let (_, result) = editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "insertNote", "kind": "footnote", "text": "첫 줄\n둘째 줄"}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(result["number"], json!(1));
+        // The marker takes one offset; the caret is right after it.
+        assert_eq!(shown(&editor), "각\u{FFFC}주");
+        assert_eq!(editor.selection().focus.scalar_offset, 2);
+        let found = note(&mut editor);
+        assert_eq!(found["kind"], json!("footnote"));
+        assert_eq!(found["text"], json!("첫 줄\n둘째 줄"));
+
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "setNoteText", "text": "고친 각주"})),
+            )
+            .unwrap();
+        assert_eq!(note(&mut editor)["text"], json!("고친 각주"));
+        // Typing after the marker goes after it; the note stays.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "가").unwrap();
+        assert_eq!(shown(&editor), "각\u{FFFC}가주");
+        assert_eq!(text(&editor), "각가주");
+        assert_eq!(note(&mut editor)["found"], json!(false));
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(0, 0)).unwrap();
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "가").unwrap();
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertNote", "kind": "endnote", "text": "미주"})),
+            )
+            .unwrap();
+        assert_eq!(shown(&editor), "가\u{FFFC}각\u{FFFC}가주");
+        let found = note(&mut editor);
+        assert_eq!(found["kind"], json!("endnote"));
+        assert_eq!(found["text"], json!("미주"));
+        // Backspace over a marker is refused: text edits never remove notes.
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(1, 2)).unwrap();
+        let revision = current_revision(&editor);
+        assert!(editor.replace_selection(revision, "").is_err());
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(2, 2)).unwrap();
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(revision, action(json!({"action": "deleteNote"})))
+            .unwrap();
+        assert_eq!(shown(&editor), "가각\u{FFFC}가주");
+        let revision = current_revision(&editor);
+        editor.set_selection(revision, selected(3, 3)).unwrap();
+        assert_eq!(note(&mut editor)["text"], json!("고친 각주"));
+    }
+
+    #[test]
+    fn note_shapes_round_trip() {
+        let mut editor = editor("모양", selected(0, 0));
+        for (kind, placement) in [("footnote", "mergedColumn"), ("endnote", "sectionEnd")] {
+            let revision = current_revision(&editor);
+            editor
+                .apply_action(
+                    revision,
+                    action(json!({"action": "setNoteShape", "note": kind, "props": {
+                        "numberFormat": "circledDigit", "suffixChar": "", "startNumber": 3,
+                        "placement": placement}})),
+                )
+                .unwrap();
+            let shape = editor
+                .query(serde_json::from_value(json!({"kind": "noteShape", "note": kind})).unwrap())
+                .unwrap();
+            assert_eq!(shape["numberFormat"], json!("circledDigit"), "{kind}");
+            assert_eq!(shape["startNumber"], json!(3), "{kind}");
+            assert_eq!(shape["placement"], json!(placement), "{kind}");
+        }
     }
 
     #[test]

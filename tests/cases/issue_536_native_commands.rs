@@ -1,6 +1,7 @@
 //! Native command content/history contracts, not a claim of visual parity.
-//! 주석 갱신: 2026-11-10T02:25:00+09:00; 직전 파일 커밋: 2026-11-08T19:09:35+09:00 (c9095c5f67632e6721e800ccc7fb43ea49d26682).
+//! 주석 갱신: 2026-11-10T12:40:00+09:00; 직전 파일 커밋: 2026-11-08T19:09:35+09:00 (c9095c5f67632e6721e800ccc7fb43ea49d26682).
 //! 객체가 든 문단의 편집 계약: 글자 편집은 객체를 지우지 않는 한 허용하고 객체를 보존한다.
+//! 글자처럼 취급하는 개체(인라인 컨트롤)는 논리 위치 한 칸을 차지하며, 그 문단도 명령 대상이다.
 #![cfg(not(target_arch = "wasm32"))]
 
 use rhwp::document_core::native_interaction::{
@@ -389,6 +390,9 @@ fn native_commands_select_all_is_limited_to_the_current_body_section() {
     assert_eq!(texts(&editor), ["가😀", "나다"]);
 }
 
+/// hwpmac/native-actions: a paragraph holding an inline control (here a
+/// character overlap) is an ordinary command target (was: refused). Moving
+/// into it, selecting across it and joining it keep the control.
 #[test]
 fn native_commands_unsupported_adjacent_inline_target_preserves_document_and_history() {
     let mut core = core(&["가", "나"]);
@@ -401,27 +405,37 @@ fn native_commands_unsupported_adjacent_inline_target_preserves_document_and_his
         NativeEditor::new(NativeDocumentSession::from_core(core), caret(0, 1)).unwrap();
     editor.replace_selection(0, "x").unwrap();
     editor.undo(1).unwrap();
-    let revision = editor.session().revision();
-    let before = format!("{:?}", editor.session().document().document());
-    for command in [
-        Command::DeleteForward {},
+    let overlaps = |editor: &NativeEditor| {
+        editor.session().document().document().sections[0]
+            .paragraphs
+            .iter()
+            .map(|paragraph| {
+                paragraph
+                    .controls
+                    .iter()
+                    .filter(|control| matches!(control, Control::CharOverlap(_)))
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    run(
+        &mut editor,
         Command::MoveRight {
             extend_selection: false,
         },
-        Command::SelectAll {},
-    ] {
-        assert!(matches!(
-            editor.execute_command(revision, command),
-            Err(NativeHostError::Unsupported(_))
-        ));
-        assert_eq!(editor.selection(), &caret(0, 1));
-        assert_eq!(editor.session().revision(), revision);
-        assert!(editor.can_redo());
-    }
-    assert_eq!(
-        format!("{:?}", editor.session().document().document()),
-        before
     );
+    assert_eq!(editor.selection(), &caret(1, 0));
+    run(&mut editor, Command::SelectAll {});
+    assert_eq!(editor.selection().focus.paragraph, 1);
+    editor
+        .set_selection(editor.session().revision(), caret(0, 1))
+        .unwrap();
+    run(&mut editor, Command::DeleteForward {});
+    assert_eq!(texts(&editor), ["가나"]);
+    assert_eq!(overlaps(&editor), 1);
+    editor.undo(editor.session().revision()).unwrap();
+    assert_eq!(texts(&editor), ["가", "나"]);
+    assert_eq!(overlaps(&editor), 1);
 }
 
 #[test]

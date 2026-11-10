@@ -106,7 +106,7 @@ impl NativeEditor {
             }
             NativeEditCommand::End { extend_selection } => {
                 let mut target = self.selection().focus.clone();
-                target.scalar_offset = scalar_len(self.command_text(&target))?;
+                target.scalar_offset = scalar_len(&self.command_text(&target))?;
                 self.move_focus(expected_revision, target, extend_selection)?
             }
             NativeEditCommand::MoveUp {
@@ -264,8 +264,8 @@ impl NativeEditor {
         self.set_selection(revision, NativeTextSelection { anchor, focus })
     }
 
-    fn command_text(&self, position: &NativeTextPosition) -> &str {
-        Self::paragraph_text(self.session().document(), position).unwrap_or("")
+    fn command_text(&self, position: &NativeTextPosition) -> std::borrow::Cow<'_, str> {
+        Self::paragraph_text(self.session().document(), position).unwrap_or_default()
     }
 
     fn container_len(&self, position: &NativeTextPosition) -> usize {
@@ -282,13 +282,13 @@ impl NativeEditor {
             return Ok(if backward { start } else { end }.clone());
         }
         let mut target = self.selection().focus.clone();
-        let text = self.command_text(&target);
+        let text = &*self.command_text(&target);
         let length = scalar_len(text)?;
         let paragraph = Self::leaf(&target);
         if backward && target.scalar_offset == 0 {
             if paragraph > 0 {
                 target = Self::at_leaf(&target, paragraph - 1, 0);
-                target.scalar_offset = scalar_len(self.command_text(&target))?;
+                target.scalar_offset = scalar_len(&self.command_text(&target))?;
             }
         } else if !backward && target.scalar_offset == length {
             if (paragraph as usize) + 1 < self.container_len(&target) {
@@ -310,7 +310,7 @@ impl NativeEditor {
             return self.replace_selection(revision, "");
         }
         let focus = self.selection().focus.clone();
-        let text = self.command_text(&focus);
+        let text = &*self.command_text(&focus);
         let length = scalar_len(text)?;
         if backward && focus.scalar_offset == 0 {
             return self.join_at(revision, Self::leaf(&focus));
@@ -360,7 +360,7 @@ impl NativeEditor {
         }
         let next = Self::at_leaf(&self.selection().focus, paragraph, 0);
         let mut previous = Self::at_leaf(&next, paragraph - 1, 0);
-        previous.scalar_offset = scalar_len(self.command_text(&previous))?;
+        previous.scalar_offset = scalar_len(&self.command_text(&previous))?;
         let span = NativeTextSelection {
             anchor: previous.clone(),
             focus: next.clone(),
@@ -424,16 +424,13 @@ impl NativeEditor {
         Self::validate_selection(self.session().document(), selection)?;
         let focus = &selection.focus;
         let paragraphs = Self::container(self.session().document(), focus)?;
-        let paragraph = &paragraphs[Self::leaf(focus) as usize];
-        let length = paragraph.text.chars().count();
+        let paragraph = crate::document_core::native_interaction::native_paragraph_text(
+            &paragraphs[Self::leaf(focus) as usize],
+        );
+        let length = paragraph.chars().count();
         let start = (focus.scalar_offset as usize).saturating_sub(NATIVE_IME_CONTEXT_SCALARS / 2);
         let end = length.min(start.saturating_add(NATIVE_IME_CONTEXT_SCALARS));
-        let text = paragraph
-            .text
-            .chars()
-            .skip(start)
-            .take(end - start)
-            .collect();
+        let text = paragraph.chars().skip(start).take(end - start).collect();
         let anchor = &selection.anchor;
         let anchor_scalar = (Self::leaf(anchor) == Self::leaf(focus)
             && (anchor.scalar_offset as usize) >= start
@@ -453,7 +450,9 @@ impl NativeEditor {
                 selected.push('\n');
                 count += 1;
             }
-            let text = &paragraphs[index as usize].text;
+            let text = crate::document_core::native_interaction::native_paragraph_text(
+                &paragraphs[index as usize],
+            );
             let left = if index == first {
                 from.scalar_offset as usize
             } else {
