@@ -145,6 +145,13 @@ pub enum NativeAction {
         natural_width: u32,
         natural_height: u32,
     },
+    /// A shape floating in front of the text where a body-text caret is:
+    /// `kind` rectangle, ellipse, line or textbox (an empty text box).
+    InsertShape {
+        kind: String,
+        width: u32,
+        height: u32,
+    },
     /// Deletes the picture, shape or table control `control` of body
     /// paragraph `paragraph` (as listed by `pageObjects`).
     DeleteObject {
@@ -487,6 +494,39 @@ impl NativeEditor {
                         "",
                         Some(to_units(rect.x)),
                         Some(to_units(rect.y)),
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::InsertShape {
+                kind,
+                width,
+                height,
+            } => {
+                if !matches!(kind.as_str(), "rectangle" | "ellipse" | "line" | "textbox") {
+                    return Err(NativeHostError::InvalidArgument(
+                        "shape: rectangle, ellipse, line or textbox".into(),
+                    ));
+                }
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let caret = body_caret(&selection.focus, "shapes are inserted in body text")?;
+                    let rect = core.native_caret_rect(caret)?;
+                    let to_units = |pixels: f64| (pixels.max(0.0) * 75.0).round() as u32;
+                    core.create_shape_control_native(
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        caret.scalar_offset as usize,
+                        width,
+                        height,
+                        to_units(rect.x),
+                        to_units(rect.y),
+                        false,
+                        "InFrontOfText",
+                        &kind,
+                        false,
+                        false,
+                        &[],
                     )?;
                     Ok(selection.clone())
                 })?;
@@ -2055,5 +2095,40 @@ mod tests {
             editor.query(NativeQuery::FieldInfo {}).unwrap()["inField"],
             json!(false)
         );
+    }
+
+    #[test]
+    fn shapes_insert_in_front_of_the_text_and_order() {
+        let mut editor = editor("도형", selected(1, 1));
+        for kind in ["rectangle", "ellipse"] {
+            let revision = current_revision(&editor);
+            editor
+                .apply_action(
+                    revision,
+                    action(json!({"action": "insertShape", "kind": kind, "width": 8504, "height": 5669})),
+                )
+                .unwrap();
+        }
+        let shapes: Vec<Value> = editor.query(NativeQuery::PageObjects { page: 0 }).unwrap()
+            ["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|object| object["type"] == json!("shape"))
+            .cloned()
+            .collect();
+        assert_eq!(shapes.len(), 2);
+        let first = &shapes[0];
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "objectOrder", "section": first["secIdx"], "paragraph": first["paraIdx"],
+                              "control": first["controlIdx"], "operation": "front"})),
+            )
+            .unwrap();
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "새").unwrap();
+        assert_eq!(text(&editor), "도새형");
     }
 }
