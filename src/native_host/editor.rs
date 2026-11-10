@@ -1520,6 +1520,7 @@ mod marks_tests {
             paragraph_marks: true,
             control_codes: false,
             transparent_borders: true,
+            clip: false,
         };
         editor.set_editor_marks(marks);
         assert_eq!(editor.session().editor_marks(), marks);

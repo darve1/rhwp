@@ -52,6 +52,17 @@ pub enum NativeAction {
         same_width: bool,
         spacing: i16,
     },
+    /// 구역 설정 of the caret's section: `pageNum` (start), `hideHeader`,
+    /// `hideFooter`, `hideMasterPage`, `hideBorder`, `hideFill` (first page),
+    /// `defaultTabSpacing`, `columnSpacing`, … (set_section_def_native keys).
+    SetSectionDef {
+        props: Value,
+    },
+    /// 쪽 테두리/배경 of the caret's section: `borderLeft`…`borderBottom`
+    /// `{type,width,color}`, `fillType`, `fillColor`, `basis`, `spacing*`, …
+    SetPageBorder {
+        props: Value,
+    },
     /// Page setup of the caret's section, as rhwp's PageDef JSON (HWPUNIT).
     SetPageDef {
         props: Value,
@@ -234,6 +245,10 @@ pub enum NativeQuery {
         paragraph: u32,
         control: u32,
     },
+    /// 구역 설정 of the section holding the selection start.
+    SectionDef {},
+    /// 쪽 테두리/배경 of that section.
+    PageBorder {},
     /// `{"count","kind","sameWidth","spacing"}`: that section's columns.
     Columns {},
     /// `{"sections":[html…]}`: each section's body as the clipboard HTML
@@ -765,6 +780,20 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::SetSectionDef { props } | NativeAction::SetPageBorder { props } => {
+                let border = matches!(action, NativeAction::SetPageBorder { .. });
+                let props = props.to_string();
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let section = selection.focus.section as usize;
+                    if border {
+                        core.set_page_border_fill_native(section, &props)?;
+                    } else {
+                        core.set_section_def_native(section, &props)?;
+                    }
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::SetPageDef { props } => {
                 let props = props.to_string();
                 let outcome = self.action_transaction(expected_revision, |core, selection| {
@@ -957,6 +986,12 @@ impl NativeEditor {
                 paragraph as usize,
                 control as usize,
             )?),
+            NativeQuery::SectionDef {} => {
+                parse(&core.get_section_def_native(start.section as usize)?)
+            }
+            NativeQuery::PageBorder {} => {
+                parse(&core.get_page_border_fill_native(start.section as usize)?)
+            }
             NativeQuery::Columns {} => {
                 use crate::model::page::ColumnType;
                 let columns = DocumentCore::find_initial_column_def(
@@ -2130,5 +2165,39 @@ mod tests {
         let revision = current_revision(&editor);
         editor.replace_selection(revision, "새").unwrap();
         assert_eq!(text(&editor), "도새형");
+    }
+
+    #[test]
+    fn section_settings_and_page_border_round_trip() {
+        let mut editor = editor("구역", selected(0, 0));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "setSectionDef", "props": {"pageNum": 7, "hideHeader": true}}),
+                ),
+            )
+            .unwrap();
+        let section = editor.query(NativeQuery::SectionDef {}).unwrap();
+        assert_eq!(section["pageNum"], json!(7));
+        assert_eq!(section["hideHeader"], json!(true));
+        let line = json!({"type": 1, "width": 1, "color": "#000000"});
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "setPageBorder", "props": {"borderLeft": line, "borderRight": line,
+                              "borderTop": line, "borderBottom": line}})),
+            )
+            .unwrap();
+        let border = editor.query(NativeQuery::PageBorder {}).unwrap();
+        assert_eq!(border["borderTop"]["type"], json!(1));
+        let revision = current_revision(&editor);
+        editor.undo(revision).unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::PageBorder {}).unwrap()["borderTop"]["type"],
+            json!(0)
+        );
     }
 }

@@ -143,6 +143,13 @@ pub struct NativeEditorMarks {
     pub paragraph_marks: bool,
     pub control_codes: bool,
     pub transparent_borders: bool,
+    /// Clip drawing to the page (the default); off shows what spills over.
+    #[serde(default = "clip_default")]
+    pub clip: bool,
+}
+
+fn clip_default() -> bool {
+    true
 }
 
 impl NativeDocumentSession {
@@ -151,6 +158,7 @@ impl NativeDocumentSession {
         self.core.show_paragraph_marks = marks.paragraph_marks;
         self.core.show_control_codes = marks.control_codes;
         self.core.show_transparent_borders = marks.transparent_borders;
+        self.core.clip_enabled = marks.clip;
         self.core.invalidate_page_tree_cache();
     }
 
@@ -159,6 +167,7 @@ impl NativeDocumentSession {
             paragraph_marks: self.core.show_paragraph_marks,
             control_codes: self.core.show_control_codes,
             transparent_borders: self.core.show_transparent_borders,
+            clip: self.core.clip_enabled,
         }
     }
 
