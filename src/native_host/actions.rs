@@ -254,6 +254,40 @@ pub enum NativeAction {
         control: u32,
         operation: String,
     },
+    /// 스타일 고치기: `props` (`name`, `englishName`, `nextStyleId`), and
+    /// changes to its 글자 모양 / 문단 모양 in the same keys as charFormat /
+    /// paraFormat. Paragraphs that use the style follow.
+    UpdateStyle {
+        id: u32,
+        #[serde(default)]
+        props: Value,
+        #[serde(default)]
+        char_props: Value,
+        #[serde(default)]
+        para_props: Value,
+    },
+    /// 문단 번호 모양 on the paragraphs the selection touches: a new numbering
+    /// with `level_formats` (`^1.`, `(^2)`, …) and `number_formats` (codes
+    /// per level, as the web editor's presets), or none when both are empty.
+    /// `restart` 2 starts the first paragraph's list again at `start`.
+    ApplyNumberingShape {
+        level_formats: Vec<String>,
+        number_formats: Vec<u8>,
+        #[serde(default)]
+        restart: u8,
+        #[serde(default = "first_number")]
+        start: u32,
+    },
+    /// 새 스타일 named `name` after the styles, starting from the 모양 of style
+    /// `based_on`; the result is its id.
+    CreateStyle {
+        name: String,
+        based_on: u32,
+    },
+    /// Deletes style `id` (not 바탕글); its paragraphs become 바탕글.
+    DeleteStyle {
+        id: u32,
+    },
     /// The document style `id` on every paragraph the selection touches
     /// (body text or top-level table cells).
     ApplyStyle {
@@ -365,9 +399,12 @@ pub enum NativeQuery {
     DocumentHtml {},
     /// The link at the selection start, `{"fieldId","start","end","text","uri"}`, or null.
     Hyperlink {},
-    /// `{"styles":[{"id","name","englishName","type"}],"current":id}`: the
-    /// document's styles and the style of the paragraph at the selection start.
+    /// `{"styles":[{"id","name","englishName","type","nextStyleId"}],"current":id}`:
+    /// the document's styles and the style of the paragraph at the selection start.
     Styles {},
+    /// `{"charProps","paraProps"}` of style `id`, in the charProperties /
+    /// paraProperties format.
+    StyleDetail { id: u32 },
     /// `{"exists":…,"text":…}` for a header or footer of that section.
     HeaderFooter { is_header: bool, apply_to: u8 },
     /// The first match at or after the selection end (forward), or the last
@@ -992,6 +1029,110 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::UpdateStyle {
+                id,
+                props,
+                char_props,
+                para_props,
+            } => {
+                let shape_json = |value: &Value| match value {
+                    Value::Object(map) if !map.is_empty() => value.to_string(),
+                    _ => String::new(),
+                };
+                let (char_json, para_json) = (shape_json(&char_props), shape_json(&para_props));
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    if id as usize >= core.document().doc_info.styles.len() {
+                        return Err(NativeHostError::InvalidArgument("no such style".into()));
+                    }
+                    if matches!(&props, Value::Object(map) if !map.is_empty()) {
+                        core.update_style_native(id, &props.to_string());
+                    }
+                    if (!char_json.is_empty() || !para_json.is_empty())
+                        && !core.update_style_shapes_native(id, &char_json, &para_json)
+                    {
+                        return Err(NativeHostError::InvalidArgument(
+                            "the style's shapes could not change".into(),
+                        ));
+                    }
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::ApplyNumberingShape {
+                level_formats,
+                number_formats,
+                restart,
+                start,
+            } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    if level_formats.is_empty() && number_formats.is_empty() {
+                        Self::format_paragraphs(core, selection, r#"{"headType":"None"}"#)?;
+                        return Ok(selection.clone());
+                    }
+                    let id = create_numbering(core, &level_formats, &number_formats, start);
+                    Self::format_paragraphs(
+                        core,
+                        selection,
+                        &json!({ "headType": "Number", "numberingId": id }).to_string(),
+                    )?;
+                    let (first, _) = Self::ordered(selection);
+                    if restart == 2 && first.cell_path.is_empty() {
+                        core.set_numbering_restart_native(
+                            first.section as usize,
+                            first.paragraph as usize,
+                            2,
+                            start,
+                        )?;
+                    }
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::CreateStyle { name, based_on } => {
+                let mut result = Value::Null;
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let Some(base) = core
+                        .document()
+                        .doc_info
+                        .styles
+                        .get(based_on as usize)
+                        .cloned()
+                    else {
+                        return Err(NativeHostError::InvalidArgument("no such style".into()));
+                    };
+                    let next = core.document().doc_info.styles.len();
+                    let created = core.create_style_native(
+                        &json!({
+                            "name": name,
+                            "englishName": "",
+                            "type": base.style_type,
+                            "nextStyleId": next,
+                            "baseCharShapeId": base.char_shape_id,
+                            "baseParaShapeId": base.para_shape_id,
+                        })
+                        .to_string(),
+                    );
+                    if created < 0 {
+                        return Err(NativeHostError::LimitExceeded(
+                            "no room for another style".into(),
+                        ));
+                    }
+                    result = json!({ "id": created });
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, result))
+            }
+            NativeAction::DeleteStyle { id } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    if !core.delete_style_native(id) {
+                        return Err(NativeHostError::InvalidArgument(
+                            "바탕글 and missing styles cannot be deleted".into(),
+                        ));
+                    }
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::ObjectOrder {
                 section,
                 paragraph,
@@ -1510,6 +1651,7 @@ impl NativeEditor {
                             "name": style.local_name,
                             "englishName": style.english_name,
                             "type": style.style_type,
+                            "nextStyleId": style.next_style_id,
                         })
                     })
                     .collect();
@@ -1517,6 +1659,12 @@ impl NativeEditor {
                     .get(Self::leaf(&start) as usize)
                     .map(|paragraph| paragraph.style_id);
                 Ok(json!({ "styles": styles, "current": current }))
+            }
+            NativeQuery::StyleDetail { id } => {
+                if id as usize >= core.document().doc_info.styles.len() {
+                    return Err(NativeHostError::InvalidArgument("no such style".into()));
+                }
+                parse(&core.get_style_detail_native(id))
             }
             NativeQuery::Hyperlink {} => {
                 let offset = Self::text_offset(core, &start)?;
@@ -2324,6 +2472,38 @@ fn form_fields(core: &DocumentCore) -> Vec<Value> {
         }
     }
     fields
+}
+
+/// A numbering definition with the given level formats and number format
+/// codes, as the web editor's `createNumbering` builds it; its 1-based id.
+fn create_numbering(
+    core: &mut DocumentCore,
+    level_formats: &[String],
+    number_formats: &[u8],
+    start: u32,
+) -> u16 {
+    use crate::model::style::{Numbering, NumberingHead, NUMBERING_LEVELS};
+    let mut numbering = Numbering::default();
+    for (level, format) in level_formats.iter().take(NUMBERING_LEVELS).enumerate() {
+        numbering.level_formats[level] = format.clone();
+    }
+    for (level, &code) in number_formats.iter().take(NUMBERING_LEVELS).enumerate() {
+        numbering.heads[level] = NumberingHead {
+            number_format: code,
+            attr: 1 << 3, // 자동 내어쓰기 (한/글 기본 머리 모양)
+            ..Default::default()
+        };
+    }
+    numbering.start_number = start.clamp(1, u16::MAX as u32) as u16;
+    numbering.level_start_numbers = [u32::from(numbering.start_number); NUMBERING_LEVELS];
+    let doc_info = &mut core.document.doc_info;
+    doc_info.numberings.push(numbering);
+    doc_info.raw_stream_dirty = true;
+    doc_info.numberings.len() as u16
+}
+
+fn first_number() -> u32 {
+    1
 }
 
 fn true_value() -> bool {
@@ -3348,6 +3528,94 @@ mod tests {
         editor.set_selection(revision, selected(0, 0)).unwrap();
         let revision = current_revision(&editor);
         editor.replace_selection(revision, "x").unwrap();
+    }
+
+    #[test]
+    fn styles_change_create_and_delete() {
+        let mut editor = editor("스타일", selected(0, 0));
+        let styles = |editor: &mut NativeEditor| editor.query(NativeQuery::Styles {}).unwrap();
+        let count = styles(&mut editor)["styles"].as_array().unwrap().len();
+        // The paragraph uses 바탕글 (0); make 바탕글 bold and rename it.
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "updateStyle", "id": 0, "props": {"name": "본문 바탕"},
+                              "charProps": {"bold": true}}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(styles(&mut editor)["styles"][0]["name"], json!("본문 바탕"));
+        let detail = editor.query(NativeQuery::StyleDetail { id: 0 }).unwrap();
+        assert_eq!(detail["charProps"]["bold"], json!(true));
+        assert_eq!(char_property(&mut editor, 0, "bold"), json!(true));
+
+        let revision = current_revision(&editor);
+        let (_, created) = editor
+            .apply_action(
+                revision,
+                action(json!({"action": "createStyle", "name": "새 스타일", "basedOn": 0})),
+            )
+            .unwrap();
+        assert_eq!(created["id"], json!(count));
+        assert_eq!(
+            styles(&mut editor)["styles"][count]["name"],
+            json!("새 스타일")
+        );
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "applyStyle", "id": count})),
+            )
+            .unwrap();
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "deleteStyle", "id": count})),
+            )
+            .unwrap();
+        assert_eq!(
+            styles(&mut editor)["styles"].as_array().unwrap().len(),
+            count
+        );
+        assert_eq!(styles(&mut editor)["current"], json!(0));
+        let revision = current_revision(&editor);
+        assert!(editor
+            .apply_action(revision, action(json!({"action": "deleteStyle", "id": 0})))
+            .is_err());
+    }
+
+    #[test]
+    fn numbering_shapes_apply_and_clear() {
+        let mut editor = editor("번호", selected(0, 0));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "applyNumberingShape",
+                              "levelFormats": ["제^1장", "제^2절"], "numberFormats": [0, 0],
+                              "restart": 2, "start": 3})),
+            )
+            .unwrap();
+        let props = editor.query(NativeQuery::ParaProperties {}).unwrap();
+        assert_eq!(props["headType"], json!("Number"));
+        let id = props["numberingId"].as_u64().unwrap() as usize;
+        let numbering = &editor.session().document().document().doc_info.numberings[id - 1];
+        assert_eq!(numbering.level_formats[0], "제^1장");
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "applyNumberingShape", "levelFormats": [], "numberFormats": []})),
+            )
+            .unwrap();
+        assert_eq!(
+            editor.query(NativeQuery::ParaProperties {}).unwrap()["headType"],
+            json!("None")
+        );
     }
 
     #[test]

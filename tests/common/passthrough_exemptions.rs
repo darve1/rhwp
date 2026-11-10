@@ -5,6 +5,12 @@
 /// 파일 경로는 [`SCAN_ROOT`] 기준 상대 경로다. 병합 `devel` 기준 46건(2026-08-30 동결).
 const EXEMPT: &[(&str, &str, Exempt, &str)] = &[
     (
+        "commands/style_ops.rs",
+        "delete_style_native",
+        Exempt::DelegatesTo("remap_style_ids"),
+        "hwpmac/native-actions: wasm_api 에서 옮긴 스타일 삭제. 스타일 번호를 옮기는 공통 함수가 구역 raw_stream 과 DocInfo 원본을 무효화한다.",
+    ),
+    (
         "commands/text_editing.rs",
         "insert_text_in_cell_by_path",
         Exempt::DelegatesTo("insert_text_in_cell_at_caret_by_path"),
