@@ -1807,6 +1807,49 @@ mod inline_object_tests {
         assert_eq!(bold(&mut editor, 1), json!(false));
     }
 
+    /// Text typed before a treat-as-char table shares its line. In this sample
+    /// the layout puts those runs outside a text line; only the complete page
+    /// text (search indexing) picks them up.
+    #[test]
+    fn complete_page_text_keeps_the_text_beside_an_inline_table() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/2010-01-06.hwp");
+        let core = DocumentCore::from_bytes(&std::fs::read(path).unwrap()).unwrap();
+        assert!(paragraph_holds_inline_table(
+            &core.document().sections[0].paragraphs[0]
+        ));
+        let start = NativeTextPosition {
+            section: 0,
+            paragraph: 0,
+            scalar_offset: 0,
+            cell_path: Vec::new(),
+        };
+        let mut editor = NativeEditor::new(
+            NativeDocumentSession::from_core(core),
+            NativeTextSelection {
+                anchor: start.clone(),
+                focus: start,
+            },
+        )
+        .unwrap();
+        editor.replace_selection(0, "새 문단").unwrap();
+        let core = editor.session().document();
+        assert!(!core
+            .extract_page_text_native(0)
+            .unwrap()
+            .contains("새 문단"));
+        assert!(core
+            .extract_page_text_complete_native(0)
+            .unwrap()
+            .contains("새 문단"));
+    }
+
+    fn paragraph_holds_inline_table(paragraph: &Paragraph) -> bool {
+        paragraph.controls.iter().any(|control| match control {
+            Control::Table(table) => table.common.treat_as_char,
+            _ => false,
+        })
+    }
+
     #[test]
     fn splitting_after_the_object_keeps_it_in_the_first_paragraph() {
         let mut editor = editor_with_inline_picture();

@@ -225,8 +225,9 @@ fn export_text_to_dir(
     let mut written = Vec::new();
 
     for page_num in pages {
+        // The complete variant keeps the text beside treat-as-char tables.
         let mut text = doc
-            .extract_page_text_native(page_num)
+            .extract_page_text_complete_native(page_num)
             .map_err(|e| format!("페이지 {} 텍스트 추출 실패 - {:?}", page_num, e))?;
         ensure_trailing_newline(&mut text);
 
@@ -248,8 +249,9 @@ fn read_text(input_path: &Path, target_page: Option<u32>) -> Result<String, Stri
 
     let mut extracted = Vec::new();
     for page_num in pages {
+        // The complete variant keeps the text beside treat-as-char tables (search indexing).
         let mut text = doc
-            .extract_page_text_native(page_num)
+            .extract_page_text_complete_native(page_num)
             .map_err(|e| format!("페이지 {} 텍스트 추출 실패 - {:?}", page_num, e))?;
         ensure_trailing_newline(&mut text);
         extracted.push((page_num, text));

@@ -8732,6 +8732,18 @@ impl DocumentCore {
     ///
     /// TextLine 노드의 시각적 순서를 유지하며 TextRun/각주 마커/양식 텍스트를 합친다.
     pub fn extract_page_text_native(&self, page_num: u32) -> Result<String, HwpError> {
+        self.extract_page_text_lines(page_num, false)
+    }
+
+    /// [`Self::extract_page_text_native`] plus the text runs the layout places
+    /// outside a text line — the text beside a treat-as-char table on its
+    /// line — each run of them as one line, in tree order. For search
+    /// indexing, where that text would otherwise be missing.
+    pub fn extract_page_text_complete_native(&self, page_num: u32) -> Result<String, HwpError> {
+        self.extract_page_text_lines(page_num, true)
+    }
+
+    fn extract_page_text_lines(&self, page_num: u32, loose_runs: bool) -> Result<String, HwpError> {
         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
 
         fn collect_line_text(node: &RenderNode, out: &mut String, has_token: &mut bool) {
@@ -8778,7 +8790,7 @@ impl DocumentCore {
             }
         }
 
-        fn collect_page_lines(node: &RenderNode, lines: &mut Vec<String>) {
+        fn collect_page_lines(node: &RenderNode, lines: &mut Vec<String>, loose_runs: bool) {
             if matches!(
                 node.node_type,
                 RenderNodeType::TextLine(_) | RenderNodeType::Equation(_)
@@ -8794,14 +8806,33 @@ impl DocumentCore {
                 return;
             }
 
+            // Consecutive runs outside a text line make one line.
+            let mut loose = String::new();
+            let mut has_loose = false;
             for child in &node.children {
-                collect_page_lines(child, lines);
+                if loose_runs
+                    && matches!(
+                        child.node_type,
+                        RenderNodeType::TextRun(_) | RenderNodeType::FootnoteMarker(_)
+                    )
+                {
+                    collect_line_text(child, &mut loose, &mut has_loose);
+                    continue;
+                }
+                if has_loose {
+                    lines.push(std::mem::take(&mut loose));
+                    has_loose = false;
+                }
+                collect_page_lines(child, lines, loose_runs);
+            }
+            if has_loose {
+                lines.push(loose);
             }
         }
 
         let tree = self.build_page_tree(page_num)?;
         let mut lines = Vec::new();
-        collect_page_lines(&tree.root, &mut lines);
+        collect_page_lines(&tree.root, &mut lines, loose_runs);
         Ok(lines.join("\n"))
     }
 

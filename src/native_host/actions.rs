@@ -163,7 +163,17 @@ pub enum NativeAction {
         width: u32,
         height: u32,
     },
-    /// Deletes the picture, shape or table control `control` of body
+    /// 수식 at a collapsed body-text caret, as a treat-as-char object;
+    /// `script` is 한글's equation script (`a over b`, `sqrt x`, …),
+    /// `fontSize` in HWPUNIT (1000 = 10 pt). The result is its address.
+    InsertEquation {
+        script: String,
+        #[serde(default = "equation_font_size")]
+        font_size: u32,
+        #[serde(default)]
+        color: u32,
+    },
+    /// Deletes the picture, shape, equation or table control `control` of body
     /// paragraph `paragraph` (as listed by `pageObjects`).
     DeleteObject {
         section: u32,
@@ -625,6 +635,48 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::InsertEquation {
+                script,
+                font_size,
+                color,
+            } => {
+                let mut result = Value::Null;
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    if selection.anchor != selection.focus {
+                        return Err(NativeHostError::Unsupported(
+                            "an equation is inserted at a collapsed caret".into(),
+                        ));
+                    }
+                    let caret =
+                        body_caret(&selection.focus, "equations are inserted in body text")?;
+                    let (s, p) = (caret.section as usize, caret.paragraph as usize);
+                    let created = parse(&core.insert_equation_native(
+                        s,
+                        p,
+                        Self::text_offset(core, caret)?,
+                        &script,
+                        font_size,
+                        color,
+                    )?)?;
+                    let paragraph = created["paraIdx"].as_u64().unwrap_or(p as u64) as usize;
+                    let control = created["controlIdx"].as_u64().unwrap_or(0) as usize;
+                    result = json!({ "section": s, "paragraph": paragraph, "control": control });
+                    // The caret goes right after the new equation.
+                    let mut after = caret.clone();
+                    if let Some(slot) = core.document().sections[s].paragraphs[paragraph]
+                        .logical_control_positions()
+                        .get(control)
+                    {
+                        after.paragraph = paragraph as u32;
+                        after.scalar_offset = *slot as u32 + 1;
+                    }
+                    Ok(NativeTextSelection {
+                        anchor: after.clone(),
+                        focus: after,
+                    })
+                })?;
+                Ok((outcome, result))
+            }
             NativeAction::DeleteObject {
                 section,
                 paragraph,
@@ -635,12 +687,12 @@ impl NativeEditor {
                     match object_kind(core, s, p, c) {
                         Some("picture") => core.delete_picture_control_native(s, p, c)?,
                         Some("shape") => core.delete_shape_control_native(s, p, c)?,
+                        Some("equation") => core.delete_equation_control_native(s, p, c)?,
                         Some(_) => core.delete_table_control_native(s, p, c)?,
-                        None => {
-                            return Err(NativeHostError::Unsupported(
-                                "only pictures, shapes and tables can be deleted as objects".into(),
-                            ))
-                        }
+                        None => return Err(NativeHostError::Unsupported(
+                            "only pictures, shapes, equations and tables can be deleted as objects"
+                                .into(),
+                        )),
                     };
                     // The caret's offsets stay valid; fall back to the paragraph start.
                     Ok(if Self::validate_selection(core, selection).is_ok() {
@@ -690,6 +742,9 @@ impl NativeEditor {
                     match object_kind(core, s, p, c) {
                         Some("picture") => core.set_picture_properties_native(s, p, c, &props)?,
                         Some("shape") => core.set_shape_properties_native(s, p, c, &props)?,
+                        Some("equation") => {
+                            core.set_equation_properties_native(s, p, c, None, None, &props)?
+                        }
                         Some(_) => core.set_table_properties_native(s, p, c, &props)?,
                         None => {
                             return Err(NativeHostError::Unsupported(
@@ -1303,6 +1358,7 @@ impl NativeEditor {
                 let mut props = parse(&match kind {
                     "picture" => core.get_picture_properties_native(s, p, c)?,
                     "shape" => core.get_shape_properties_native(s, p, c)?,
+                    "equation" => core.get_equation_properties_native(s, p, c, None, None)?,
                     _ => core.get_table_properties_native(s, p, c)?,
                 })?;
                 props["kind"] = json!(kind);
@@ -2123,8 +2179,13 @@ fn object_kind(
         Control::Picture(_) => Some("picture"),
         Control::Shape(_) => Some("shape"),
         Control::Table(_) => Some("table"),
+        Control::Equation(_) => Some("equation"),
         _ => None,
     }
+}
+
+fn equation_font_size() -> u32 {
+    1000
 }
 
 fn parse(text: &str) -> Result<Value, NativeHostError> {
@@ -2953,6 +3014,56 @@ mod tests {
             assert_eq!(shape["startNumber"], json!(3), "{kind}");
             assert_eq!(shape["placement"], json!(placement), "{kind}");
         }
+    }
+
+    #[test]
+    fn equations_insert_edit_and_delete() {
+        use crate::document_core::native_interaction::native_paragraph_text;
+        let shown = |editor: &NativeEditor| {
+            native_paragraph_text(&editor.session().document().document().sections[0].paragraphs[0])
+                .into_owned()
+        };
+        let mut editor = editor("수식", selected(1, 1));
+        let revision = current_revision(&editor);
+        let (_, created) = editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertEquation", "script": "a over b"})),
+            )
+            .unwrap();
+        assert_eq!(shown(&editor), "수\u{FFFC}식");
+        assert_eq!(editor.selection().focus.scalar_offset, 2);
+        let address = json!({"section": created["section"], "paragraph": created["paragraph"],
+                             "control": created["control"]});
+        let mut query = address.clone();
+        query["kind"] = json!("objectProperties");
+        let props = editor
+            .query(serde_json::from_value(query.clone()).unwrap())
+            .unwrap();
+        assert_eq!(props["kind"], json!("equation"));
+        assert_eq!(props["script"], json!("a over b"));
+        assert_eq!(props["fontSize"], json!(1000));
+
+        let revision = current_revision(&editor);
+        let mut request = address.clone();
+        request["action"] = json!("setObjectProperties");
+        request["props"] = json!({"script": "x^2 + 1", "fontSize": 1400});
+        editor.apply_action(revision, action(request)).unwrap();
+        let props = editor
+            .query(serde_json::from_value(query).unwrap())
+            .unwrap();
+        assert_eq!(props["script"], json!("x^2 + 1"));
+        assert_eq!(props["fontSize"], json!(1400));
+        // Typing right after the equation keeps it.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "=").unwrap();
+        assert_eq!(shown(&editor), "수\u{FFFC}=식");
+
+        let revision = current_revision(&editor);
+        let mut request = address.clone();
+        request["action"] = json!("deleteObject");
+        editor.apply_action(revision, action(request)).unwrap();
+        assert_eq!(shown(&editor), "수=식");
     }
 
     #[test]
