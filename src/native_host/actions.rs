@@ -178,6 +178,27 @@ pub enum NativeAction {
         control: u32,
         props: Value,
     },
+    /// Properties of a picture, shape or table control, in the engine's
+    /// own names (`width`, `rotationAngle`, `borderColor`, `fillBgColor`,
+    /// `hasCaption`, …); `hasCaption` adds a numbered 그림/표 caption.
+    SetObjectProperties {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+        props: Value,
+    },
+    /// 개체 묶기: two or more pictures or shapes of one section (as listed
+    /// by `pageObjects`) become one group; the result is the group's address.
+    GroupObjects {
+        section: u32,
+        objects: Vec<ObjectRef>,
+    },
+    /// 개체 풀기: a group back into its pictures and shapes, one level.
+    UngroupObject {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+    },
     /// Stacking order of a picture or shape: front, back, forward, backward.
     ObjectOrder {
         section: u32,
@@ -229,6 +250,14 @@ pub enum NativeAction {
     AttachNextTable {},
 }
 
+/// A control of a body paragraph in a known section.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObjectRef {
+    pub paragraph: u32,
+    pub control: u32,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(
     tag = "kind",
@@ -252,6 +281,13 @@ pub enum NativeQuery {
     PageHide {},
     /// The field around a body-text caret, `{"inField":false}` if none.
     FieldInfo {},
+    /// Properties of a picture, shape or table control, with `kind`
+    /// `picture`, `shape` or `table`.
+    ObjectProperties {
+        section: u32,
+        paragraph: u32,
+        control: u32,
+    },
     /// Properties of a picture control.
     PictureProperties {
         section: u32,
@@ -567,26 +603,15 @@ impl NativeEditor {
             } => {
                 let outcome = self.action_transaction(expected_revision, |core, selection| {
                     let (s, p, c) = (section as usize, paragraph as usize, control as usize);
-                    let kind = match core
-                        .document()
-                        .sections
-                        .get(s)
-                        .and_then(|section| section.paragraphs.get(p))
-                        .and_then(|paragraph| paragraph.controls.get(c))
-                    {
-                        Some(Control::Picture(_)) => 0,
-                        Some(Control::Shape(_)) => 1,
-                        Some(Control::Table(_)) => 2,
-                        _ => {
+                    match object_kind(core, s, p, c) {
+                        Some("picture") => core.delete_picture_control_native(s, p, c)?,
+                        Some("shape") => core.delete_shape_control_native(s, p, c)?,
+                        Some(_) => core.delete_table_control_native(s, p, c)?,
+                        None => {
                             return Err(NativeHostError::Unsupported(
                                 "only pictures, shapes and tables can be deleted as objects".into(),
                             ))
                         }
-                    };
-                    match kind {
-                        0 => core.delete_picture_control_native(s, p, c)?,
-                        1 => core.delete_shape_control_native(s, p, c)?,
-                        _ => core.delete_table_control_native(s, p, c)?,
                     };
                     // The caret's offsets stay valid; fall back to the paragraph start.
                     Ok(if Self::validate_selection(core, selection).is_ok() {
@@ -621,6 +646,75 @@ impl NativeEditor {
                         &props,
                     )?;
                     Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::SetObjectProperties {
+                section,
+                paragraph,
+                control,
+                props,
+            } => {
+                let props = props.to_string();
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let (s, p, c) = (section as usize, paragraph as usize, control as usize);
+                    match object_kind(core, s, p, c) {
+                        Some("picture") => core.set_picture_properties_native(s, p, c, &props)?,
+                        Some("shape") => core.set_shape_properties_native(s, p, c, &props)?,
+                        Some(_) => core.set_table_properties_native(s, p, c, &props)?,
+                        None => {
+                            return Err(NativeHostError::Unsupported(
+                                "object properties apply to pictures, shapes and tables".into(),
+                            ))
+                        }
+                    };
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::GroupObjects { section, objects } => {
+                let mut result = Value::Null;
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let targets: Vec<(usize, usize)> = objects
+                        .iter()
+                        .map(|object| (object.paragraph as usize, object.control as usize))
+                        .collect();
+                    if targets.iter().any(|&(p, c)| {
+                        !matches!(
+                            object_kind(core, section as usize, p, c),
+                            Some("picture" | "shape")
+                        )
+                    }) {
+                        return Err(NativeHostError::Unsupported(
+                            "only pictures and shapes can be grouped".into(),
+                        ));
+                    }
+                    let created = parse(&core.group_shapes_native(section as usize, &targets)?)?;
+                    result = json!({
+                        "section": section,
+                        "paragraph": created["paraIdx"],
+                        "control": created["controlIdx"],
+                    });
+                    Ok(Self::validate_selection(core, selection)
+                        .map(|_| selection.clone())
+                        .unwrap_or_else(|_| paragraph_start(section, targets[0].0 as u32)))
+                })?;
+                Ok((outcome, result))
+            }
+            NativeAction::UngroupObject {
+                section,
+                paragraph,
+                control,
+            } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    core.ungroup_shape_native(
+                        section as usize,
+                        paragraph as usize,
+                        control as usize,
+                    )?;
+                    Ok(Self::validate_selection(core, selection)
+                        .map(|_| selection.clone())
+                        .unwrap_or_else(|_| paragraph_start(section, paragraph)))
                 })?;
                 Ok((outcome, Value::Null))
             }
@@ -1036,6 +1130,25 @@ impl NativeEditor {
                     start.paragraph as usize,
                     start.scalar_offset as usize,
                 ))
+            }
+            NativeQuery::ObjectProperties {
+                section,
+                paragraph,
+                control,
+            } => {
+                let (s, p, c) = (section as usize, paragraph as usize, control as usize);
+                let kind = object_kind(core, s, p, c).ok_or_else(|| {
+                    NativeHostError::Unsupported(
+                        "object properties apply to pictures, shapes and tables".into(),
+                    )
+                })?;
+                let mut props = parse(&match kind {
+                    "picture" => core.get_picture_properties_native(s, p, c)?,
+                    "shape" => core.get_shape_properties_native(s, p, c)?,
+                    _ => core.get_table_properties_native(s, p, c)?,
+                })?;
+                props["kind"] = json!(kind);
+                Ok(props)
             }
             NativeQuery::PictureProperties {
                 section,
@@ -1674,6 +1787,43 @@ fn resolve_font_name(core: &mut DocumentCore, props: &Value) -> String {
     props.to_string()
 }
 
+/// A collapsed caret at the start of a body paragraph.
+fn paragraph_start(section: u32, paragraph: u32) -> NativeTextSelection {
+    let start = NativeTextPosition {
+        section,
+        paragraph,
+        scalar_offset: 0,
+        cell_path: Vec::new(),
+    };
+    NativeTextSelection {
+        anchor: start.clone(),
+        focus: start,
+    }
+}
+
+/// `picture`, `shape` or `table` for a body-paragraph control, else None.
+fn object_kind(
+    core: &DocumentCore,
+    section: usize,
+    paragraph: usize,
+    control: usize,
+) -> Option<&'static str> {
+    match core
+        .document()
+        .sections
+        .get(section)?
+        .paragraphs
+        .get(paragraph)?
+        .controls
+        .get(control)?
+    {
+        Control::Picture(_) => Some("picture"),
+        Control::Shape(_) => Some("shape"),
+        Control::Table(_) => Some("table"),
+        _ => None,
+    }
+}
+
 fn parse(text: &str) -> Result<Value, NativeHostError> {
     serde_json::from_str(text).map_err(|error| {
         NativeHostError::InvalidArgument(format!("engine returned invalid JSON: {error}"))
@@ -2288,6 +2438,123 @@ mod tests {
         let revision = current_revision(&editor);
         editor.replace_selection(revision, "새").unwrap();
         assert_eq!(text(&editor), "도새형");
+    }
+
+    #[test]
+    fn object_properties_for_shapes_and_captions_for_tables() {
+        let mut editor = editor("개체", selected(1, 1));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertShape", "kind": "rectangle", "width": 8504, "height": 5669})),
+            )
+            .unwrap();
+        let shape = editor.query(NativeQuery::PageObjects { page: 0 }).unwrap()["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|object| object["type"] == json!("shape"))
+            .cloned()
+            .unwrap();
+        let address = json!({"section": shape["secIdx"], "paragraph": shape["paraIdx"], "control": shape["controlIdx"]});
+        let revision = current_revision(&editor);
+        let mut request = address.clone();
+        request["action"] = json!("setObjectProperties");
+        request["props"] = json!({"borderColor": 255, "fillType": "solid", "fillBgColor": 65280, "rotationAngle": 30});
+        editor.apply_action(revision, action(request)).unwrap();
+        let mut query = address.clone();
+        query["kind"] = json!("objectProperties");
+        let props = editor
+            .query(serde_json::from_value(query).unwrap())
+            .unwrap();
+        assert_eq!(props["kind"], json!("shape"));
+        assert_eq!(props["borderColor"], json!(255));
+        assert_eq!(props["fillBgColor"], json!(65280));
+        assert_eq!(props["rotationAngle"], json!(30));
+
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "insertTable", "rows": 1, "cols": 1})),
+            )
+            .unwrap();
+        let cell = editor.selection().focus.clone();
+        let table = json!({"section": cell.section, "paragraph": cell.paragraph,
+                           "control": cell.cell_path[0].control});
+        let revision = current_revision(&editor);
+        let mut request = table.clone();
+        request["action"] = json!("setObjectProperties");
+        request["props"] = json!({"hasCaption": true});
+        editor.apply_action(revision, action(request)).unwrap();
+        let mut query = table.clone();
+        query["kind"] = json!("objectProperties");
+        let props = editor
+            .query(serde_json::from_value(query).unwrap())
+            .unwrap();
+        assert_eq!(props["kind"], json!("table"));
+        assert_eq!(props["hasCaption"], json!(true));
+        // The caret stays in the cell and typing still works.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "셀").unwrap();
+        assert_eq!(editor.selection().focus.cell_path.len(), 1);
+    }
+
+    #[test]
+    fn shapes_group_and_ungroup() {
+        let mut editor = editor("묶기", selected(1, 1));
+        for kind in ["rectangle", "ellipse"] {
+            let revision = current_revision(&editor);
+            editor
+                .apply_action(
+                    revision,
+                    action(json!({"action": "insertShape", "kind": kind, "width": 8504, "height": 5669})),
+                )
+                .unwrap();
+        }
+        let kinds = |editor: &mut NativeEditor| -> Vec<Value> {
+            editor.query(NativeQuery::PageObjects { page: 0 }).unwrap()["controls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|object| {
+                    object["type"] == json!("shape") || object["type"] == json!("group")
+                })
+                .cloned()
+                .collect()
+        };
+        let shapes = kinds(&mut editor);
+        assert_eq!(shapes.len(), 2);
+        let objects: Vec<Value> = shapes
+            .iter()
+            .map(|shape| json!({"paragraph": shape["paraIdx"], "control": shape["controlIdx"]}))
+            .collect();
+        let revision = current_revision(&editor);
+        let (_, group) = editor
+            .apply_action(
+                revision,
+                action(json!({"action": "groupObjects", "section": 0, "objects": objects})),
+            )
+            .unwrap();
+        let grouped = kinds(&mut editor);
+        assert_eq!(grouped.len(), 1, "{grouped:?}");
+        assert_eq!(grouped[0]["type"], json!("group"));
+        assert_eq!(grouped[0]["controlIdx"], group["control"]);
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(
+                    json!({"action": "ungroupObject", "section": 0, "paragraph": group["paragraph"],
+                              "control": group["control"]}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(kinds(&mut editor).len(), 2);
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "새").unwrap();
+        assert_eq!(text(&editor), "묶새기");
     }
 
     #[test]
