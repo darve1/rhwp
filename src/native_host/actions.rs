@@ -172,6 +172,26 @@ pub enum NativeAction {
     ApplyStyle {
         id: u32,
     },
+    /// Properties of the caret's cell in a top-level table (`fillType`,
+    /// `fillColor`, `verticalAlign`, `padding*`, `border*`, …).
+    SetCellProperties {
+        props: Value,
+    },
+    /// 감추기 on the caret's body paragraph, from its page on.
+    SetPageHide {
+        header: bool,
+        footer: bool,
+        master_page: bool,
+        border: bool,
+        fill: bool,
+        page_number: bool,
+    },
+    /// 새 쪽 번호: page numbering restarts at `start` from the caret's page.
+    NewPageNumber {
+        start: u16,
+    },
+    /// Removes the field (누름틀 and the like) around a body-text caret.
+    RemoveField {},
     /// 표 나누기: the caret's row starts a new table below.
     SplitTable {},
     /// 표 붙이기: the next table, after only empty paragraphs, joins this one.
@@ -195,6 +215,12 @@ pub enum NativeQuery {
     /// The objects laid out on page `page` with their page boxes (layout
     /// pixels) and addresses: the core's page control layout.
     PageObjects { page: u32 },
+    /// Properties of the caret's cell.
+    CellProperties {},
+    /// 감추기 flags of the caret's body paragraph.
+    PageHide {},
+    /// The field around a body-text caret, `{"inField":false}` if none.
+    FieldInfo {},
     /// Properties of a picture control.
     PictureProperties {
         section: u32,
@@ -571,6 +597,82 @@ impl NativeEditor {
                 })?;
                 Ok((outcome, Value::Null))
             }
+            NativeAction::SetCellProperties { props } => {
+                let props = props.to_string();
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let (table, cell) = TableAddress::of(&selection.focus)?;
+                    core.set_cell_properties_native(
+                        table.section as usize,
+                        table.paragraph as usize,
+                        table.control as usize,
+                        cell as usize,
+                        &props,
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::SetPageHide {
+                header,
+                footer,
+                master_page,
+                border,
+                fill,
+                page_number,
+            } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let caret = body_caret(&selection.focus, "감추기 goes on a body paragraph")?;
+                    core.set_page_hide_native(
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        header,
+                        footer,
+                        master_page,
+                        border,
+                        fill,
+                        page_number,
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::NewPageNumber { start } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let caret = body_caret(&selection.focus, "새 쪽 번호 goes in body text")?;
+                    core.insert_new_number_native(
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        caret.scalar_offset as usize,
+                        start.max(1),
+                    )?;
+                    Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::RemoveField {} => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let caret = body_caret(&selection.focus, "fields are removed in body text")?;
+                    core.remove_field_at(
+                        caret.section as usize,
+                        caret.paragraph as usize,
+                        caret.scalar_offset as usize,
+                    )?;
+                    // The field's text went with it; keep the caret if it still fits.
+                    Ok(if Self::validate_selection(core, selection).is_ok() {
+                        selection.clone()
+                    } else {
+                        let start = NativeTextPosition {
+                            scalar_offset: 0,
+                            ..caret.clone()
+                        };
+                        NativeTextSelection {
+                            anchor: start.clone(),
+                            focus: start,
+                        }
+                    })
+                })?;
+                Ok((outcome, Value::Null))
+            }
             NativeAction::ApplyStyle { id } => {
                 let outcome = self.action_transaction(expected_revision, |core, selection| {
                     let (start, end) = Self::ordered(selection);
@@ -783,6 +885,29 @@ impl NativeEditor {
                 Ok(json!({ "sections": sections }))
             }
             NativeQuery::PageObjects { page } => parse(&core.get_page_control_layout_native(page)?),
+            NativeQuery::CellProperties {} => {
+                let (_, cell) = TableAddress::of(&start)?;
+                parse(&core.get_cell_properties_by_cell_path_native(
+                    start.section as usize,
+                    start.paragraph as usize,
+                    &Self::core_path(&start),
+                    cell as usize,
+                )?)
+            }
+            NativeQuery::PageHide {} => {
+                let caret = body_caret(&start, "감추기 is on body paragraphs")?;
+                parse(&core.get_page_hide_native(caret.section as usize, caret.paragraph as usize)?)
+            }
+            NativeQuery::FieldInfo {} => {
+                if !start.cell_path.is_empty() {
+                    return Ok(json!({ "inField": false }));
+                }
+                parse(&core.get_field_info_at(
+                    start.section as usize,
+                    start.paragraph as usize,
+                    start.scalar_offset as usize,
+                ))
+            }
             NativeQuery::PictureProperties {
                 section,
                 paragraph,
@@ -1091,6 +1216,18 @@ fn link_target(position: &NativeTextPosition) -> crate::document_core::hyperlink
 
 fn same_width() -> bool {
     true
+}
+
+/// `position` if it is in body text, else an "unsupported" error.
+fn body_caret<'a>(
+    position: &'a NativeTextPosition,
+    message: &str,
+) -> Result<&'a NativeTextPosition, NativeHostError> {
+    if position.cell_path.is_empty() {
+        Ok(position)
+    } else {
+        Err(NativeHostError::Unsupported(message.into()))
+    }
 }
 
 fn one() -> u16 {
@@ -1882,5 +2019,41 @@ mod tests {
             .iter()
             .any(|c| matches!(c, Control::Picture(_))));
         assert_eq!(text(&editor), "그림새 앞뒤");
+    }
+
+    #[test]
+    fn page_hide_and_new_page_number_on_the_caret_paragraph() {
+        let mut editor = editor("감추기", selected(0, 0));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "setPageHide", "header": true, "footer": false,
+                              "masterPage": false, "border": false, "fill": false, "pageNumber": true})),
+            )
+            .unwrap();
+        let hide = editor.query(NativeQuery::PageHide {}).unwrap();
+        assert_eq!(hide["exists"], json!(true));
+        assert_eq!(hide["hideHeader"], json!(true));
+        assert_eq!(hide["hidePageNum"], json!(true));
+        let revision = current_revision(&editor);
+        editor
+            .apply_action(
+                revision,
+                action(json!({"action": "newPageNumber", "start": 5})),
+            )
+            .unwrap();
+        let controls = &editor.session().document().document().sections[0].paragraphs[0].controls;
+        assert!(controls
+            .iter()
+            .any(|control| matches!(control, Control::NewNumber(_))));
+        // Typing in the paragraph still works next to both controls.
+        let revision = current_revision(&editor);
+        editor.replace_selection(revision, "가").unwrap();
+        assert_eq!(text(&editor), "가감추기");
+        assert_eq!(
+            editor.query(NativeQuery::FieldInfo {}).unwrap()["inField"],
+            json!(false)
+        );
     }
 }
