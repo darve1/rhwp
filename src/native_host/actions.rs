@@ -195,6 +195,19 @@ pub enum NativeAction {
     SetCellProperties {
         props: Value,
     },
+    /// 계산식 in the caret's cell of a top-level table (`=SUM(ABOVE)`,
+    /// `=A1+B1`, …); `format` is `%g` or `%.Nf`, with a trailing `,` for
+    /// thousands separators. The cell shows the result.
+    SetCellFormula {
+        formula: String,
+        format: String,
+    },
+    /// The number in the first paragraph of the caret's cell: `thousands`
+    /// adds (or removes) thousands separators, `addDecimal` appends a 0,
+    /// `removeDecimal` drops the last decimal digit, as the web editor does.
+    FormatCellNumber {
+        operation: String,
+    },
     /// 감추기 on the caret's body paragraph, from its page on.
     SetPageHide {
         header: bool,
@@ -664,6 +677,53 @@ impl NativeEditor {
                         &props,
                     )?;
                     Ok(selection.clone())
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::SetCellFormula { formula, format } => {
+                let outcome = self.action_transaction(expected_revision, |core, selection| {
+                    let (table, cell) = TableAddress::of(&selection.focus)?;
+                    core.set_table_cell_formula(
+                        table.section as usize,
+                        table.paragraph as usize,
+                        table.control as usize,
+                        cell as usize,
+                        &formula,
+                        &format,
+                    )?;
+                    Ok(Self::validate_selection(core, selection)
+                        .map(|_| selection.clone())
+                        .unwrap_or_else(|_| table.caret_in(cell)))
+                })?;
+                Ok((outcome, Value::Null))
+            }
+            NativeAction::FormatCellNumber { operation } => {
+                let focus = self.selection.focus.clone();
+                let (_, cell) = TableAddress::of(&focus)?;
+                let mut first = focus.clone();
+                if let Some(entry) = first.cell_path.last_mut() {
+                    entry.cell = cell;
+                    entry.paragraph = 0;
+                }
+                first.scalar_offset = 0;
+                let text = Self::paragraph_text(&self.session.core, &first)?.to_owned();
+                let Some(formatted) = format_cell_number(&text, &operation) else {
+                    return Err(NativeHostError::InvalidArgument(
+                        "the cell does not hold a number".into(),
+                    ));
+                };
+                let mut end = first.clone();
+                end.scalar_offset = text.chars().count() as u32;
+                let outcome = self.action_transaction(expected_revision, |core, _| {
+                    Self::delete_in_container(core, &first, &end)?;
+                    Self::insert_in_container(core, &first, &formatted)?;
+                    Self::recalculate_formulas(core, &first)?;
+                    let mut caret = first.clone();
+                    caret.scalar_offset = formatted.chars().count() as u32;
+                    Ok(NativeTextSelection {
+                        anchor: caret.clone(),
+                        focus: caret,
+                    })
                 })?;
                 Ok((outcome, Value::Null))
             }
@@ -1291,6 +1351,69 @@ fn link_target(position: &NativeTextPosition) -> crate::document_core::hyperlink
 
 fn same_width() -> bool {
     true
+}
+
+/// The web editor's 세 자리 쉼표 / 자릿수 늘리기 / 자릿수 줄이기 on a cell's text;
+/// None when the text is not a plain (optionally signed, comma-grouped) number.
+fn format_cell_number(text: &str, operation: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let (sign, rest) = match trimmed.chars().next()? {
+        '+' | '-' => trimmed.split_at(1),
+        _ => ("", trimmed),
+    };
+    let had_commas = rest.contains(',');
+    let digits = rest.replace(',', "");
+    let (integer, decimals) = match digits.split_once('.') {
+        Some((integer, decimals)) => (integer.to_owned(), Some(decimals.to_owned())),
+        None => (digits.clone(), None),
+    };
+    if integer.is_empty()
+        || !integer.chars().all(|c| c.is_ascii_digit())
+        || !decimals
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let group = |integer: &str| {
+        let mut grouped = String::new();
+        for (index, digit) in integer.chars().enumerate() {
+            if index > 0 && (integer.len() - index) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(digit);
+        }
+        grouped
+    };
+    let integer_text = |commas: bool| {
+        if commas {
+            group(&integer)
+        } else {
+            integer.clone()
+        }
+    };
+    let joined = |integer: String, decimals: Option<&str>| match decimals {
+        Some(decimals) if !decimals.is_empty() => format!("{sign}{integer}.{decimals}"),
+        _ => format!("{sign}{integer}"),
+    };
+    match operation {
+        "thousands" => Some(joined(integer_text(!had_commas), decimals.as_deref())),
+        "addDecimal" => Some(format!(
+            "{sign}{}.{}0",
+            integer_text(had_commas),
+            decimals.as_deref().unwrap_or("")
+        )),
+        "removeDecimal" => {
+            let decimals = decimals.filter(|d| !d.is_empty())?;
+            Some(joined(
+                integer_text(had_commas),
+                Some(&decimals[..decimals.len() - 1]),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// `position` if it is in body text, else an "unsupported" error.
@@ -2199,5 +2322,35 @@ mod tests {
             editor.query(NativeQuery::PageBorder {}).unwrap()["borderTop"]["type"],
             json!(0)
         );
+    }
+
+    #[test]
+    fn cell_number_formats() {
+        assert_eq!(
+            format_cell_number("1234567", "thousands").as_deref(),
+            Some("1,234,567")
+        );
+        assert_eq!(
+            format_cell_number("-1,234.5", "thousands").as_deref(),
+            Some("-1234.5")
+        );
+        assert_eq!(
+            format_cell_number("12", "addDecimal").as_deref(),
+            Some("12.0")
+        );
+        assert_eq!(
+            format_cell_number("1,200.5", "addDecimal").as_deref(),
+            Some("1,200.50")
+        );
+        assert_eq!(
+            format_cell_number("3.14", "removeDecimal").as_deref(),
+            Some("3.1")
+        );
+        assert_eq!(
+            format_cell_number("3.1", "removeDecimal").as_deref(),
+            Some("3")
+        );
+        assert_eq!(format_cell_number("3", "removeDecimal"), None);
+        assert_eq!(format_cell_number("합계", "thousands"), None);
     }
 }

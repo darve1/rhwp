@@ -735,6 +735,7 @@ impl NativeEditor {
             if !text.is_empty() {
                 Self::insert_in_container(core, start, text)?;
             }
+            Self::recalculate_formulas(core, start)?;
             return Ok(());
         }
         if start.paragraph == end.paragraph
@@ -993,6 +994,24 @@ impl NativeEditor {
                 &Self::core_path(position),
                 position.scalar_offset as usize,
                 None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 한글 recalculates a table's 계산식 whenever one of its cells changes;
+    /// so does this, for top-level tables after a cell text edit.
+    pub(super) fn recalculate_formulas(
+        core: &mut DocumentCore,
+        position: &NativeTextPosition,
+    ) -> Result<(), NativeHostError> {
+        if let [cell] = position.cell_path.as_slice() {
+            core.recalculate_table_formulas(
+                position.section as usize,
+                position.paragraph as usize,
+                cell.control as usize,
+                Some(cell.cell as usize),
+                true,
             )?;
         }
         Ok(())
@@ -1403,6 +1422,49 @@ mod cell_tests {
         caret(&mut editor, in_cell(paragraph, control, 0, 0, 0));
         act(&mut editor, json!({"action": "attachNextTable"}));
         assert_eq!(shape(&editor, paragraph, control), (3, 2, 6));
+    }
+
+    #[test]
+    fn cell_formula_sums_the_cells_above_and_formats_numbers() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&core.create_table_native(0, 0, 0, 3, 1).unwrap()).unwrap();
+        let paragraph = created["paraIdx"].as_u64().unwrap() as u32;
+        let control = created["controlIdx"].as_u64().unwrap() as u32;
+        let start = in_cell(paragraph, control, 0, 0, 0);
+        let mut editor = NativeEditor::new(
+            NativeDocumentSession::from_core(core),
+            NativeTextSelection {
+                anchor: start.clone(),
+                focus: start,
+            },
+        )
+        .unwrap();
+        type_text(&mut editor, "1200");
+        caret(&mut editor, in_cell(paragraph, control, 1, 0, 0));
+        type_text(&mut editor, "34");
+        caret(&mut editor, in_cell(paragraph, control, 2, 0, 0));
+        act(
+            &mut editor,
+            json!({"action": "setCellFormula", "formula": "=SUM(ABOVE)", "format": "%g"}),
+        );
+        assert_eq!(cell_texts(&editor, paragraph, control, 2), ["1234"]);
+        // Editing a number the formula reads recalculates it, as in 한글.
+        caret(&mut editor, in_cell(paragraph, control, 1, 0, 2));
+        type_text(&mut editor, "0");
+        assert_eq!(cell_texts(&editor, paragraph, control, 2), ["1540"]);
+        caret(&mut editor, in_cell(paragraph, control, 0, 0, 0));
+        act(
+            &mut editor,
+            json!({"action": "formatCellNumber", "operation": "thousands"}),
+        );
+        assert_eq!(cell_texts(&editor, paragraph, control, 0), ["1,200"]);
+        act(
+            &mut editor,
+            json!({"action": "formatCellNumber", "operation": "addDecimal"}),
+        );
+        assert_eq!(cell_texts(&editor, paragraph, control, 0), ["1,200.0"]);
     }
 }
 
